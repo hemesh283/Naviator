@@ -14,7 +14,6 @@
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-training-EE4C2C?logo=pytorch&logoColor=white">
   <img alt="ONNX Runtime" src="https://img.shields.io/badge/ONNX%20Runtime-on--device-005CED?logo=onnx&logoColor=white">
   <img alt="MapLibre" src="https://img.shields.io/badge/MapLibre-offline%20vector%20tiles-396CB2">
-  <img alt="Smart India Hackathon 2026" src="https://img.shields.io/badge/Smart%20India%20Hackathon-2026%20%C2%B7%20SIH26168-FF9933">
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green">
 </p>
 
@@ -22,7 +21,7 @@
 
 ## Why
 
-GPS (and India's NavIC) needs line of sight to the sky. In tunnels, underground parking and between tall buildings the fix freezes or vanishes, which is exactly when ambulances, delivery riders and fleet trackers lose continuity. Automotive dead-reckoning modules solve this with dedicated sensors and CAN-bus wheel-speed data. This project attacks the harder version posed by **ISRO in Smart India Hackathon 2026 (problem statement SIH26168)**: do it with **nothing but a smartphone**, fully offline.
+GPS (and India's NavIC) needs line of sight to the sky. In tunnels, underground parking and between tall buildings the fix freezes or vanishes, which is exactly when ambulances, delivery riders and fleet trackers lose continuity. Automotive dead-reckoning modules solve this with dedicated sensors and CAN-bus wheel-speed data. This project attacks the harder version: do it with **nothing but a smartphone**, fully offline.
 
 ## Highlights
 
@@ -163,7 +162,7 @@ No sensor data in this project is synthetic. The only simulated element in evalu
 
 ## Authors
 
-Built by **Hemesh** ([@hemesh283](https://github.com/hemesh283)) — navigation engine, Android app, offline maps and evaluation — with teammates from the Smart India Hackathon 2026 team, who contributed parts of the ML pipeline and UI.
+Built by **Hemesh** ([@hemesh283](https://github.com/hemesh283)) — navigation engine, Android app, offline maps and evaluation — with teammates who contributed parts of the ML pipeline and UI.
 
 ## License
 
@@ -171,7 +170,6 @@ Code is released under the [MIT License](LICENSE). Third-party data keeps its ow
 
 ## Acknowledgements
 
-- Problem statement **SIH26168** by the **Indian Space Research Organisation (ISRO)**, Smart India Hackathon 2026.
 - IO-VNBD: Onyekpe et al., *IO-VNBD: Inertial and Odometry benchmark dataset for ground vehicle positioning*, Data in Brief (2021).
 - OxIOD: Chen et al., *OxIOD: The Dataset for Deep Inertial Odometry*, arXiv:1809.07491.
 - Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), tiles in the [OpenMapTiles](https://openmaptiles.org/) schema, rendered with [MapLibre Native](https://maplibre.org/).
