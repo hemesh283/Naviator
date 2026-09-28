@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-duckdb
-pydantic
-pandas
-numpy
-pytz
