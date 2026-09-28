@@ -42,8 +42,11 @@ class ZuptDetectorTest {
             gyroMagnitudeThreshold = 0.10f
         )
 
-        // Accel is low, but phone is rotating (gyro is high)
-        for (i in 0 until 15) {
+        // Accel is low, but phone is rotating (gyro is high). 30 samples = 300 ms, past the
+        // 200 ms rotation-confirmation time -- before that, the detector is still in its initial
+        // state (STATIONARY by default), so a shorter run would test the start-up default, not
+        // whether rotation blocks stationary detection.
+        for (i in 0 until 30) {
             val sample = ImuSample(
                 timestampNs = (i + 1) * 10_000_000L,
                 ax = 0.01f,

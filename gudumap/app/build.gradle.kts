@@ -40,6 +40,14 @@ android {
     androidResources {
         noCompress += listOf("onnx", "map", "mbtiles", "sqlite", "json", "pbf")
     }
+
+    // Local JVM unit tests run against a stub android.jar in which every Android API throws
+    // "not mocked". Engine code logs state transitions with android.util.Log (e.g. ZuptDetector),
+    // so let those stubs return defaults (Log.i -> 0) instead of failing the test. Test-only;
+    // has no effect on the app itself.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
