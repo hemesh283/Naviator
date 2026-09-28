@@ -85,3 +85,7 @@ SIH26168-DeadReckoning/data/raw_traces/*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local scratch/export folder (packages zipped up to send to teammates, compile-check
+# snapshots, etc.) -- derived copies of files already tracked elsewhere.
+dead_reckoning/share/

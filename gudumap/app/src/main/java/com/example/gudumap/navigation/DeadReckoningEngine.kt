@@ -357,6 +357,35 @@ class DeadReckoningEngine(
             )
             currentLat = newGeodetic[0]
             currentLon = newGeodetic[1]
+
+            // §51: `trajectoryIntegrator` (the source of `distanceTravelled`/the on-screen
+            // distance stat) was previously fed *only* from the periodic ML/DR window-processing
+            // step further down in this file (the one gated by the ML kinematic-plausibility
+            // gate, ZUPT, and the blackout-only pedestrian fallback -- all deliberately tuned
+            // and hardened for VEHICLE motion during GNSS blackout, per §24/§25/§32/§33). This
+            // GNSS-fused position update -- which runs on every normal, non-blackout GPS fix,
+            // i.e. exactly the "just walk around with GPS available" case -- never once told
+            // the integrator distance had been covered, so the on-screen distance stayed flat
+            // during ordinary walking even though the map position (fed from this same
+            // currentLat/currentLon) was moving correctly from real GPS fixes. This adds that
+            // missing point so distance accumulates from real, ground-truth GNSS movement
+            // whenever GPS is available -- exactly mirroring how the DR window path accumulates
+            // it from estimated movement during blackout. `isBlackoutMode` above already returns
+            // early before this point, so this can only ever run in normal/non-blackout mode --
+            // it does not touch, and cannot affect, the blackout-mode DR-distance benchmarking
+            // this pipeline was tuned against.
+            trajectoryIntegrator.addPoint(
+                TrajectoryPoint(
+                    latitude = currentLat,
+                    longitude = currentLon,
+                    altitude = -ekf.state[2],
+                    speedMps = speedMps ?: 0f,
+                    headingDeg = currentHeadingDeg,
+                    timestampNs = System.nanoTime(),
+                    isBlackout = false,
+                    isStationary = zuptDetector.isNavStationary
+                )
+            )
         }
         dispatchState()
     }
@@ -564,6 +593,64 @@ class DeadReckoningEngine(
     }
 
     /**
+     * Genuine INS double-integration for the vehicle-mode ML-rejected fallback
+     * (PROJECT_STATUS.md §33). Reuses the exact same world-frame rotation and
+     * v += a*dt; d += v*dt recurrence NaiveIntegrator.kt already implements for the
+     * map's "naive trail" overlay -- not reimplemented from scratch. The one
+     * deliberate difference from NaiveIntegrator: velocity is seeded from the EKF's
+     * OWN current state (ekf.state[3]/[4], NED frame -- the average velocity
+     * `ekf.predict()` derived from the previous window's own displacement, per
+     * EKF.kt's `state[3] = deltaPNed[0]/dt` contract, PROJECT_STATUS.md §25) instead
+     * of a separate, never-fused running copy. This lets the estimate continue from
+     * wherever the EKF's velocity actually is -- including whatever ACCEPTED/CLAMPED
+     * windows already did to it -- rather than tracking a second, independent
+     * velocity the EKF never sees (which is exactly why NaiveIntegrator itself must
+     * NOT be reused as the position source, per §25's own reasoning).
+     *
+     * This mirrors exactly how the real IO-VNBD benchmark's Baseline 2 (INS + EKF,
+     * no ML) integrates in Python -- v_curr = ekf.velocity_ned; dp = v_curr*dt +
+     * 0.5*a_ned*dt^2 -- which beat every ML-inclusive baseline at every outage
+     * duration (PROJECT_STATUS.md §32). No NHC is applied when this displacement is
+     * used (see the EKF-update section below): §33 found NHC+ZUPT stacked on top of
+     * plain physics (Baseline 9) was MEASURABLY WORSE than plain physics alone
+     * (Baseline 2) at 60s/120s outages, so this deliberately matches Baseline 2
+     * exactly, not Baseline 9.
+     *
+     * Integrates only the last `imuBuffer.stride` rows of the window, same
+     * newest-samples-only convention as integrateRawPedestrianDisplacement (the
+     * first `stride` rows of any window are the same samples as the previous
+     * window's last `stride` rows -- integrating the full window every call would
+     * double-count 1.0s of real motion).
+     *
+     * @return NED-frame displacement [deltaNorth, deltaEast, 0] in meters, already
+     *         rotated -- ready to hand directly to ekf.predict(), unlike
+     *         localDisplacement elsewhere in this function which is rotated later.
+     */
+    private fun integrateInsDisplacementFromEkfVelocity(window: Array<FloatArray>): FloatArray {
+        val sampleDtSec = (imuBuffer.targetDtNs / 1_000_000_000.0).toFloat()
+        val newSamplesStart = max(0, window.size - imuBuffer.stride)
+
+        var vNorth = ekf.state[3].toFloat()
+        var vEast = ekf.state[4].toFloat()
+        var dNorth = 0f
+        var dEast = 0f
+        for (i in newSamplesStart until window.size) {
+            val vehAcc = floatArrayOf(
+                window[i][0] * ModelMetadata.GRAVITY_MPS2,
+                window[i][1] * ModelMetadata.GRAVITY_MPS2,
+                window[i][2] * ModelMetadata.GRAVITY_MPS2
+            )
+            val worldAcc = transformer.rotateLocalToWorld(vehAcc, currentHeadingDeg)
+            vNorth += worldAcc[0] * sampleDtSec
+            vEast += worldAcc[1] * sampleDtSec
+            dNorth += vNorth * sampleDtSec
+            dEast += vEast * sampleDtSec
+        }
+
+        return floatArrayOf(dNorth, dEast, 0f)
+    }
+
+    /**
      * Process ready 20x6 window (scheduled at stride = 10 samples).
      */
     private fun processWindowInference(window: Array<FloatArray>, timestampNs: Long) {
@@ -713,13 +800,33 @@ class DeadReckoningEngine(
             // the EKF, just without NHC. isNavStationary is checked first and wins regardless of
             // mode (Task 1.4): genuinely not moving still means exactly 0.0m, never
             // walking-speed noise.
-            if (isNavStationary || (gateAction == GateAction.REJECTED && !isPedestrianFallbackActive)) {
-                // When genuinely rejected or stationary, feed [0,0,0] to EKF and enforce zero-velocity
+            if (isNavStationary) {
+                // Genuinely stationary (any mode): feed [0,0,0] to EKF and enforce zero-velocity.
+                // Unchanged from before this session -- PROJECT_STATUS.md §33 only restructures
+                // the vehicle-mode ML-REJECTED-but-moving case below, not this one.
                 ekf.predict(doubleArrayOf(0.0, 0.0, 0.0), dt)
                 ekf.updateZupt()
                 ekf.state[3] = 0.0
                 ekf.state[4] = 0.0
                 ekf.state[5] = 0.0
+            } else if (gateAction == GateAction.REJECTED && !isPedestrianFallbackActive) {
+                // Vehicle mode, not stationary, ML kinematic gate rejected this window's
+                // prediction. Previously this froze position (fed [0,0,0], same as the
+                // stationary case above) -- PROJECT_STATUS.md §32 showed physics-only (no ML at
+                // all) beats every ML-inclusive baseline at every real outage duration, so
+                // freezing here throws away a strictly-better estimate that was available the
+                // whole time. Advance using genuine INS double-integration instead (see
+                // integrateInsDisplacementFromEkfVelocity's own doc comment for the full
+                // reasoning and the §32/§33 evidence behind it). No NHC here, matching Baseline 2
+                // exactly -- §33 found NHC+ZUPT stacked on plain physics measurably worse than
+                // plain physics alone at 60s/120s outages.
+                val insDeltaNed = integrateInsDisplacementFromEkfVelocity(window)
+                val insDeltaNedDouble = doubleArrayOf(
+                    insDeltaNed[0].toDouble(),
+                    insDeltaNed[1].toDouble(),
+                    0.0
+                )
+                ekf.predict(insDeltaNedDouble, dt)
             } else {
                 // 3b. Coordinate transformation: local displacement -> world NED. Direction
                 // handling for the pedestrian fallback (Task 2, §25): applied along whatever

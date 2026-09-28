@@ -1,6 +1,7 @@
 package com.example.gudumap.sensors
 
 import android.hardware.SensorManager
+import android.util.Log
 import kotlin.math.sqrt
 
 data class OrientationData(
@@ -120,7 +121,22 @@ class SensorFusionManager {
         if (dt <= 0f || dt > 0.2f) return
 
         if (!hasHardwareRotation) {
-            fusedAzimuth += gyroscope[2] * dt
+            // §55: sign fix. Android's gyroscope Z axis is positive counter-clockwise as seen
+            // from above the device (right-hand rule about +Z) -- see
+            // https://developer.android.com/reference/android/hardware/SensorEvent#values
+            // ("TYPE_GYROSCOPE"). But azimuth/heading (and SensorManager.getOrientation's
+            // values[0], which this manual path is meant to approximate between hardware
+            // rotation-vector samples) is defined as rotation about -Z, i.e. it increases
+            // CLOCKWISE (turning right: facing North=0 -> facing East=90). Integrating
+            // +gyroscope[2] directly therefore turned the fused heading the WRONG way any time
+            // this fallback path was active: turning right made the estimate turn left and vice
+            // versa. This path only runs before the first TYPE_ROTATION_VECTOR sample arrives,
+            // or continuously on a device with no rotation-vector sensor at all (e.g. possibly
+            // the tablet from PROJECT_STATUS.md §50) -- it was NOT the active path on the tested
+            // Galaxy S22 (which has a rotation-vector sensor and uses it via updateRotationVector,
+            // bypassing this block entirely), so this fix targets that no-rotation-vector /
+            // cold-start case specifically, not the S22 "inverted direction" report itself.
+            fusedAzimuth -= gyroscope[2] * dt
             fusedPitch += gyroscope[1] * dt
             fusedRoll += gyroscope[0] * dt
 
@@ -192,14 +208,31 @@ class SensorFusionManager {
         return result
     }
 
+    private var lastLoggedHeadingBucket = -1
+
     fun getOrientation(): OrientationData {
         var heading = Math.toDegrees(fusedAzimuth.toDouble()).toFloat()
         if (heading < 0f) heading += 360f
+        val pitchDeg = Math.toDegrees(fusedPitch.toDouble()).toFloat()
+        val rollDeg = Math.toDegrees(fusedRoll.toDouble()).toFloat()
+
+        // §55: ground-truth capture for the "locator direction inverted" report. Logs at most
+        // once per ~5 degrees of heading change (not every call -- this runs per sensor sample)
+        // so a real walking test can be replayed against a known compass bearing without
+        // flooding Logcat. hasHardwareRotation tells us which path produced this heading.
+        val bucket = (heading / 5f).toInt()
+        if (bucket != lastLoggedHeadingBucket) {
+            lastLoggedHeadingBucket = bucket
+            Log.i(
+                "Gudumap:SensorFusionManager",
+                "heading=$heading pitch=$pitchDeg roll=$rollDeg hasHardwareRotation=$hasHardwareRotation headingConfidence=$headingConfidence"
+            )
+        }
 
         return OrientationData(
             heading = heading,
-            pitch = Math.toDegrees(fusedPitch.toDouble()).toFloat(),
-            roll = Math.toDegrees(fusedRoll.toDouble()).toFloat()
+            pitch = pitchDeg,
+            roll = rollDeg
         )
     }
 

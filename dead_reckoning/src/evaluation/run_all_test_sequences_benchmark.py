@@ -1,6 +1,6 @@
 """Comprehensive Held-Out Multi-Sequence Benchmark & Generalization Audit for IO-VNBD.
 
-Evaluates the complete 7-tier navigation ladder on ALL 9 held-out test sequences from IO-VNBD:
+Evaluates the complete navigation ladder on ALL 9 held-out test sequences from IO-VNBD:
   1. Pure INS
   2. INS + EKF
   3. ML Only (Native 10 Hz IO-VNBD GRU)
@@ -8,6 +8,8 @@ Evaluates the complete 7-tier navigation ladder on ALL 9 held-out test sequences
   5. ML + INS + EKF
   6. ML + INS + EKF + NHC
   7. ML + INS + EKF + NHC + ZUPT
+  8. ML + Kinematic Gate + EKF + NHC + ZUPT
+  9. INS + EKF + NHC + ZUPT (no ML)
 
 Evaluates:
 - 10s, 30s, 60s, 120s GNSS Outages across all eligible sequences
@@ -63,6 +65,23 @@ RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw" / "IO-VNBD"
 RESULTS_DIR = PROJECT_ROOT / "results" / "io_vnbd"
 MODELS_DIR = PROJECT_ROOT / "models"
 
+# ML Kinematic Plausibility Gate constants -- faithful port of
+# DeadReckoningEngine.kt (gudumap Android app), companion object + the
+# vehicle-mode branch of processWindowInference(). Same names, same values.
+# The pedestrian-safe fallback (MotionMode.CONSERVATIVE_MODE) in that file is
+# NOT ported here -- this benchmark is IO-VNBD vehicle data only.
+GATE_MAX_SPEED_CHANGE_MPS2 = 4.0    # DeadReckoningEngine.MAX_SPEED_CHANGE_MPS2
+GATE_MAX_PLAUSIBLE_SPEED_MPS = 50.0  # DeadReckoningEngine.MAX_PLAUSIBLE_SPEED_MPS
+GATE_STRIDE_DURATION_SEC = 1.0      # ModelMetadata.STRIDE_DURATION_SEC -- the ML
+                                     # window/stride duration used in the gate's own
+                                     # kinematic-distance formula. NOT the 10 Hz
+                                     # sample dt (0.1s) used elsewhere in this file.
+GATE_TOLERANCE_M = 1.2              # gateTolerance
+GATE_CLAMP_TOLERANCE_M = 0.15       # the +0.15m added to kinematicDist when clamping
+GATE_MIN_EFFECTIVE_ACC_MPS2 = 0.20  # effectiveAcc = max(maxHorizAcc, 0.20)
+GATE_LOW_ACCEL_THRESHOLD_MPS2 = 0.35  # reject-branch condition: maxHorizAcc < 0.35
+GATE_LOW_SPEED_THRESHOLD_MPS = 0.30   # reject-branch condition: baseSpeed < 0.30
+
 
 def get_driver_name(seq_key: str, path_str: str) -> str:
     """Identify driver from sequence key and file path."""
@@ -98,6 +117,24 @@ def run_multi_sequence_audit():
     test_rows = df_manifest[df_manifest["assigned_split"] == "test"].copy()
     print(f"\n[TASK 1] Audited Test Split from {manifest_path.name}: Found {len(test_rows)} test sequences.")
 
+    def _pick_canonical_path(paths: list) -> "Path":
+        # BUG FIX: IO-VNBD ships every sequence file TWICE -- once under
+        # ".../Uncategorised IOVNB Dataset/S-Dataset/" (raw axis column names,
+        # e.g. "GYROSCOPE X/Y/Z (rad/s)") and once under ".../Categorised IOVNB
+        # Dataset/<Driver>/..." (semantic column names, "GYROSCOPE
+        # Pitch/Roll/Yaw (rad/s)") -- the naming extract_features_and_targets()
+        # actually searches for. `rglob` order is filesystem-dependent, not
+        # guaranteed, and for at least sequence "m" it returned the
+        # Uncategorised duplicate first, crashing with IndexError (no column
+        # matched "gyro"+"pitch"). Verified all 9 test sequences have both a
+        # Categorised and an Uncategorised copy, so always preferring
+        # Categorised is safe (no sequence is Categorised-only) and
+        # deterministic, instead of depending on directory traversal order.
+        for p in paths:
+            if "Categorised IOVNB Dataset" in str(p):
+                return p
+        return paths[0]
+
     test_seq_catalog = []
     for _, row in test_rows.iterrows():
         s_file = row["smartphone_file"]
@@ -107,8 +144,8 @@ def run_multi_sequence_audit():
         if not s_paths or not v_paths:
             raise FileNotFoundError(f"Cannot locate raw files: {s_file} or {v_file}")
 
-        s_path = s_paths[0]
-        v_path = v_paths[0]
+        s_path = _pick_canonical_path(s_paths)
+        v_path = _pick_canonical_path(v_paths)
         driver = get_driver_name(row["sequence_key"], str(s_path))
 
         # Check sample count
@@ -290,6 +327,19 @@ def run_multi_sequence_audit():
             dp_ned = R_bn @ np.array([dx, dy, dz], dtype=np.float64)
             step_dp_ned[s_idx : e_idx + 1] = dp_ned / stride_len
 
+        # Per-window max horizontal acceleration -- the same signal
+        # DeadReckoningEngine.kt's processWindowInference() computes over its own
+        # 20-sample window (maxHorizAcc), needed by the Kinematic Plausibility Gate
+        # (Baseline 8). Precomputed once per sequence since window contents don't
+        # change across outage-duration configs.
+        window_max_horiz_acc = np.zeros(len(w_starts), dtype=np.float64)
+        for w_idx, s_idx in enumerate(w_starts):
+            e_idx = w_ends[w_idx]
+            a_body_window = seq.features[s_idx : e_idx + 1, 0:3] * 9.80665
+            if len(a_body_window) > 0:
+                a_h = np.sqrt(a_body_window[:, 0] ** 2 + a_body_window[:, 1] ** 2)
+                window_max_horiz_acc[w_idx] = float(np.max(a_h))
+
         simulator = OutageSimulator(
             outage_durations_s=outage_durations,
             warmup_duration_s=min(15.0, seq.timestamps_s[-1] * 0.1),
@@ -316,6 +366,110 @@ def run_multi_sequence_audit():
             v0_n = spd0 * np.cos(np.deg2rad(hdg0))
             v0_e = spd0 * np.sin(np.deg2rad(hdg0))
 
+            # BUG FIX: every baseline below used to read seq.gt_hdg[i] -- the
+            # literal ground-truth vehicle heading -- at every sample INSIDE
+            # this "GNSS-denied" outage window, to rotate body-frame
+            # acceleration / ML displacement into NED. A real blackout has no
+            # heading source at all (that's the whole premise being tested),
+            # so this was leaking the answer straight into every one of the
+            # 224 benchmark evaluations, inflating every drift/RMSE number
+            # in results/io_vnbd/real_benchmark_all_test_sequences.csv.
+            # Fix: freeze heading at hdg0 (the last known-good value at
+            # outage entry) for the whole outage instead of continuing to
+            # read ground truth through it. Recompute the ML displacement's
+            # NED rotation for windows overlapping this outage using hdg0
+            # (step_dp_ned was originally rotated with the per-window real
+            # heading across the whole trace, which is fine outside outages
+            # but must not be used for the windows inside this one).
+            step_dp_ned_outage = step_dp_ned.copy()
+            for w_idx, s_idx in enumerate(w_starts):
+                e_idx = w_ends[w_idx]
+                if e_idx < s or s_idx >= e:
+                    continue  # window doesn't overlap this outage at all
+                stride_len = max(1, e_idx - s_idx + 1)
+                dx, dy, dz = ml_displacements[w_idx]
+                R_bn0 = CoordinateTransformer.heading_to_dcm(hdg0)
+                dp_ned0 = R_bn0 @ np.array([dx, dy, dz], dtype=np.float64)
+                lo, hi = max(s_idx, s), min(e_idx + 1, e)
+                step_dp_ned_outage[lo:hi] = dp_ned0 / stride_len
+
+            # ----------------------------------------------------------
+            # BASELINE 8 PREP: ML Kinematic Plausibility Gate
+            #
+            # Faithful port of DeadReckoningEngine.kt's processWindowInference()
+            # vehicle-mode gate -- same formula, same constants (see
+            # GATE_* above), same accept/clamp/reject behavior. Runs once per ML
+            # WINDOW (matching the real app's once-per-1.0s-stride inference
+            # cadence), not once per 10 Hz sample -- the resulting (possibly
+            # clamped/rejected) window-level displacement is then spread evenly
+            # across that window's samples, exactly like step_dp_ned_outage
+            # already does for the ungated baselines above.
+            #
+            # baseSpeed's envelope is seeded from spd0 (the real ground-truth
+            # speed at outage entry, already computed above) and grows at
+            # GATE_MAX_SPEED_CHANGE_MPS2 per elapsed second since the FIRST
+            # window overlapping this outage -- mirroring
+            # blackoutEntrySpeedMps/blackoutEntryTimestampNs in the Kotlin file,
+            # which are captured once at blackout entry and never touched by the
+            # gate's own output (non-self-referential, per PROJECT_STATUS.md
+            # §11 Fix 1 -- this is the exact bug this gate exists to avoid
+            # reintroducing).
+            #
+            # NOT ported: DeadReckoningEngine's separate `isNavStationary`
+            # pre-check (a multi-signal ZUPT classifier evaluated before the
+            # kinematic gate even runs). Out of scope here -- the task's own
+            # gate formula summary does not include it, and its intent
+            # ("no convincing motion -> reject") is already substantially
+            # captured by this gate's own maxHorizAcc < 0.35 reject condition.
+            step_dp_ned_gated = step_dp_ned.copy()
+            overlapping_windows = [
+                (w_idx, s_idx, w_ends[w_idx])
+                for w_idx, s_idx in enumerate(w_starts)
+                if not (w_ends[w_idx] < s or s_idx >= e)
+            ]
+            first_overlap_s_idx = overlapping_windows[0][1] if overlapping_windows else s
+            gate_action_counts = {"ACCEPTED": 0, "CLAMPED": 0, "REJECTED": 0}
+
+            for w_idx, s_idx, e_idx in overlapping_windows:
+                stride_len = max(1, e_idx - s_idx + 1)
+                dx, dy, dz = ml_displacements[w_idx]
+                raw_pred = np.array([dx, dy, dz], dtype=np.float64)
+                raw_mag = float(np.linalg.norm(raw_pred))
+
+                elapsed_blackout_sec = max(0.0, (s_idx - first_overlap_s_idx) * dt)
+                base_speed_envelope = min(
+                    spd0 + GATE_MAX_SPEED_CHANGE_MPS2 * elapsed_blackout_sec,
+                    GATE_MAX_PLAUSIBLE_SPEED_MPS,
+                )
+                max_horiz_acc = window_max_horiz_acc[w_idx]
+                effective_acc = max(max_horiz_acc, GATE_MIN_EFFECTIVE_ACC_MPS2)
+                kinematic_dist = (
+                    base_speed_envelope * GATE_STRIDE_DURATION_SEC
+                    + 0.5 * effective_acc * GATE_STRIDE_DURATION_SEC ** 2
+                )
+                max_plausible_dist = kinematic_dist + GATE_TOLERANCE_M
+
+                if (
+                    max_horiz_acc < GATE_LOW_ACCEL_THRESHOLD_MPS2
+                    and base_speed_envelope < GATE_LOW_SPEED_THRESHOLD_MPS
+                    and raw_mag > max_plausible_dist
+                ):
+                    gated_local = np.zeros(3, dtype=np.float64)
+                    gate_action_counts["REJECTED"] += 1
+                elif raw_mag > max_plausible_dist:
+                    max_clamped_dist = kinematic_dist + GATE_CLAMP_TOLERANCE_M
+                    scale = (max_clamped_dist / raw_mag) if raw_mag > 0.001 else 0.0
+                    gated_local = raw_pred * scale
+                    gate_action_counts["CLAMPED"] += 1
+                else:
+                    gated_local = raw_pred
+                    gate_action_counts["ACCEPTED"] += 1
+
+                R_bn0 = CoordinateTransformer.heading_to_dcm(hdg0)
+                dp_ned_gated = R_bn0 @ gated_local
+                lo, hi = max(s_idx, s), min(e_idx + 1, e)
+                step_dp_ned_gated[lo:hi] = dp_ned_gated / stride_len
+
             # ----------------------------------------------------------
             # BASELINE 1: Pure INS (Segment execution during outage)
             # ----------------------------------------------------------
@@ -326,7 +480,8 @@ def run_multi_sequence_audit():
             curr_pn, curr_pe = p0_n, p0_e
 
             for idx, i in enumerate(range(s, e)):
-                hdg_i = float(seq.gt_hdg[i])
+                # was: seq.gt_hdg[i] -- leaked ground-truth heading during the outage
+                hdg_i = hdg0
                 R_bn = CoordinateTransformer.heading_to_dcm(hdg_i)
                 a_body = seq.features[i, 0:3] * 9.80665
                 a_ned = R_bn @ a_body
@@ -367,7 +522,8 @@ def run_multi_sequence_audit():
             spd_2_out = np.zeros(dur_samples)
 
             for idx, i in enumerate(range(s, e)):
-                hdg_i = float(seq.gt_hdg[i])
+                # was: seq.gt_hdg[i] -- leaked ground-truth heading during the outage
+                hdg_i = hdg0
                 R_bn = CoordinateTransformer.heading_to_dcm(hdg_i)
                 a_body = seq.features[i, 0:3] * 9.80665
                 a_ned = R_bn @ a_body
@@ -405,11 +561,13 @@ def run_multi_sequence_audit():
             curr_pn, curr_pe = p0_n, p0_e
 
             for idx, i in enumerate(range(s, e)):
-                curr_pn += step_dp_ned[i, 0]
-                curr_pe += step_dp_ned[i, 1]
+                # was: step_dp_ned[i, ...] -- rotated using real per-window
+                # heading; step_dp_ned_outage uses hdg0 (frozen) instead
+                curr_pn += step_dp_ned_outage[i, 0]
+                curr_pe += step_dp_ned_outage[i, 1]
                 pn_3_out[idx] = curr_pn
                 pe_3_out[idx] = curr_pe
-                spd_3_out[idx] = float(np.sqrt(step_dp_ned[i, 0] ** 2 + step_dp_ned[i, 1] ** 2) / dt)
+                spd_3_out[idx] = float(np.sqrt(step_dp_ned_outage[i, 0] ** 2 + step_dp_ned_outage[i, 1] ** 2) / dt)
 
             lat_3 = seq.gt_lat.copy()
             lon_3 = seq.gt_lon.copy()
@@ -461,8 +619,11 @@ def run_multi_sequence_audit():
                 spd_k_out = np.zeros(dur_samples)
 
                 for idx, i in enumerate(range(s, e)):
-                    hdg_i = float(seq.gt_hdg[i])
-                    dp = step_dp_ned[i]
+                    # was: seq.gt_hdg[i] / step_dp_ned[i] -- both leaked
+                    # ground-truth heading during the outage; use the
+                    # frozen-heading versions instead
+                    hdg_i = hdg0
+                    dp = step_dp_ned_outage[i]
                     ekf.predict(dp, dt)
 
                     if use_zupt and i >= 10:
@@ -495,7 +656,114 @@ def run_multi_sequence_audit():
                 rk_dict.update({"sequence": key, "driver": driver})
                 all_outage_records.append(rk_dict)
 
-            print(f"  [{dur}s outage] ML Only Drift: {res_3.drift_percent_endpoint:5.2f}% | ML+INS Drift: {res_4.drift_percent_endpoint:5.2f}% | Pure INS Drift: {res_1.drift_percent_endpoint:5.2f}%")
+            # ----------------------------------------------------------
+            # BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT
+            #
+            # Identical to Baseline 7's fusion stage (same EKF, same NHC,
+            # same ZUPT detector/call) -- the ONLY difference is the displacement
+            # fed in: step_dp_ned_gated (gate-filtered above) instead of
+            # step_dp_ned_outage (raw ML, ungated). Added alongside Baselines
+            # 1-7 without modifying any of them, so existing comparisons stay
+            # valid.
+            # ----------------------------------------------------------
+            ekf_8 = NavigationEKF()
+            ekf_8.initialize(p0_n, p0_e, 0.0, v0_n, v0_e, 0.0)
+            pn_8_out = np.zeros(dur_samples)
+            pe_8_out = np.zeros(dur_samples)
+            spd_8_out = np.zeros(dur_samples)
+
+            for idx, i in enumerate(range(s, e)):
+                hdg_i = hdg0
+                dp = step_dp_ned_gated[i]
+                ekf_8.predict(dp, dt)
+
+                if i >= 10:
+                    recent_acc = seq.features[i - 10 : i, 0:3]
+                    recent_gyro = seq.features[i - 10 : i, 3:6]
+                    if zupt_det.is_stationary(recent_acc, recent_gyro, gnss_speed_mps=None):
+                        ekf_8.update_zupt(noise_mps=0.05)
+
+                ekf_8.update_nhc(hdg_i, noise_lat_mps=0.15, noise_vert_mps=0.15)
+
+                pos = ekf_8.position_ned
+                pn_8_out[idx] = pos[0]
+                pe_8_out[idx] = pos[1]
+                vel = ekf_8.velocity_ned
+                spd_8_out[idx] = np.sqrt(vel[0] ** 2 + vel[1] ** 2)
+
+            lat_8 = seq.gt_lat.copy()
+            lon_8 = seq.gt_lon.copy()
+            lat_8[s:e], lon_8[s:e] = ned_to_geodetic_vec(pn_8_out, pe_8_out, origin_lat, origin_lon)
+            spd_8 = seq.gt_spd.copy()
+            spd_8[s:e] = spd_8_out
+
+            res_8 = NavigationMetrics.evaluate_outage(
+                lat_8, lon_8, seq.gt_lat, seq.gt_lon,
+                s, e, dur,
+                "BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT", seq.timestamps_s, spd_8, seq.gt_spd
+            )
+            r8_dict = asdict(res_8)
+            r8_dict.update({"sequence": key, "driver": driver})
+            all_outage_records.append(r8_dict)
+
+            # ----------------------------------------------------------
+            # BASELINE 9: INS + EKF + NHC + ZUPT (no ML)
+            #
+            # Isolates whether NHC/ZUPT help at all when there is no ML
+            # displacement in the loop -- NHC/ZUPT have so far only ever been
+            # benchmarked stacked on top of ML (Baselines 6/7). Identical EKF/
+            # NHC/ZUPT application to Baseline 7's (same predict/update_zupt/
+            # update_nhc calls, same thresholds), but the displacement fed into
+            # ekf.predict() is Baseline 2's own INS-integrated dp (frozen-
+            # heading-rotated raw accelerometer, v*dt + 0.5*a*dt^2), not any ML
+            # output. Added alongside Baselines 1-8 without modifying any of
+            # them, so existing comparisons stay valid.
+            # ----------------------------------------------------------
+            ekf_9 = NavigationEKF()
+            ekf_9.initialize(p0_n, p0_e, 0.0, v0_n, v0_e, 0.0)
+            pn_9_out = np.zeros(dur_samples)
+            pe_9_out = np.zeros(dur_samples)
+            spd_9_out = np.zeros(dur_samples)
+
+            for idx, i in enumerate(range(s, e)):
+                hdg_i = hdg0
+                R_bn = CoordinateTransformer.heading_to_dcm(hdg_i)
+                a_body = seq.features[i, 0:3] * 9.80665
+                a_ned = R_bn @ a_body
+                v_curr = ekf_9.velocity_ned
+                dp = v_curr * dt + 0.5 * a_ned * (dt ** 2)
+                ekf_9.predict(dp, dt)
+
+                if i >= 10:
+                    recent_acc = seq.features[i - 10 : i, 0:3]
+                    recent_gyro = seq.features[i - 10 : i, 3:6]
+                    if zupt_det.is_stationary(recent_acc, recent_gyro, gnss_speed_mps=None):
+                        ekf_9.update_zupt(noise_mps=0.05)
+
+                ekf_9.update_nhc(hdg_i, noise_lat_mps=0.15, noise_vert_mps=0.15)
+
+                pos = ekf_9.position_ned
+                pn_9_out[idx] = pos[0]
+                pe_9_out[idx] = pos[1]
+                vel = ekf_9.velocity_ned
+                spd_9_out[idx] = np.sqrt(vel[0] ** 2 + vel[1] ** 2)
+
+            lat_9 = seq.gt_lat.copy()
+            lon_9 = seq.gt_lon.copy()
+            lat_9[s:e], lon_9[s:e] = ned_to_geodetic_vec(pn_9_out, pe_9_out, origin_lat, origin_lon)
+            spd_9 = seq.gt_spd.copy()
+            spd_9[s:e] = spd_9_out
+
+            res_9 = NavigationMetrics.evaluate_outage(
+                lat_9, lon_9, seq.gt_lat, seq.gt_lon,
+                s, e, dur,
+                "BASELINE 9: INS + EKF + NHC + ZUPT (no ML)", seq.timestamps_s, spd_9, seq.gt_spd
+            )
+            r9_dict = asdict(res_9)
+            r9_dict.update({"sequence": key, "driver": driver})
+            all_outage_records.append(r9_dict)
+
+            print(f"  [{dur}s outage] ML Only Drift: {res_3.drift_percent_endpoint:5.2f}% | ML+INS Drift: {res_4.drift_percent_endpoint:5.2f}% | Pure INS Drift: {res_1.drift_percent_endpoint:5.2f}% | Gated (B8) Drift: {res_8.drift_percent_endpoint:5.2f}% | No-ML+NHC+ZUPT (B9) Drift: {res_9.drift_percent_endpoint:5.2f}% | Gate[A:{gate_action_counts['ACCEPTED']} C:{gate_action_counts['CLAMPED']} R:{gate_action_counts['REJECTED']}]")
 
     # --------------------------------------------------------------------------
     # TASK 5: AGGREGATE RESULTS ACROSS ALL TEST SEQUENCES

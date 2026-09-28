@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager as AndroidSensorManager
+import android.util.Log
 import kotlin.math.sqrt
 
 // =========================================================
@@ -91,6 +92,26 @@ class SensorManager(
 
     private val rotationVectorSensor =
         sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
+    // §50: one-time hardware-presence log. This app has no fallback heading source (GPS
+    // course-over-ground, etc.) when both the gyroscope and magnetometer are absent -- see
+    // SensorFusionManager: without at least one of {rotation-vector sensor, magnetometer+
+    // accelerometer, gyroscope}, `fusedAzimuth` never updates past its 0f default and the
+    // heading/nav arrow appears permanently frozen. This log is the fastest way to confirm
+    // (via Logcat, filter tag "Gudumap:SensorManager") whether a given device -- e.g. a
+    // tablet reporting a "stuck" nav pointer -- actually lacks one of these sensors, before
+    // assuming it's a software bug.
+    init {
+        Log.i(
+            "Gudumap:SensorManager",
+            "Sensor hardware present on this device -- " +
+                "linearAccel=${linearAccelerometer != null} " +
+                "rawAccel=${rawAccelerometer != null} " +
+                "gyroscope=${gyroscope != null} " +
+                "magnetometer=${magnetometer != null} " +
+                "rotationVector=${rotationVectorSensor != null}"
+        )
+    }
 
     // Software gravity filter if linear accelerometer is absent
     private val gravityValues = FloatArray(3)

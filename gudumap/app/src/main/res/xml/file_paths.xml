@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- §60: the only directory shared with other apps (via the FileProvider in AndroidManifest.xml):
+     recorded sessions exported as CSV/GPX. Everything else in filesDir stays private. -->
+<paths>
+    <files-path name="sessions" path="sessions/" />
+</paths>

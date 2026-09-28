@@ -1,58 +1,63 @@
 package com.example.gudumap.ui.theme
 
-import android.app.Activity
-import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(
-    primary = Purple80,
-    secondary = PurpleGrey80,
-    tertiary = Pink80
-)
+// Deep navy / electric cyan / violet glassmorphic ColorScheme, enforced as the app's only
+// theme rather than following system light/dark.
+//
+// Confirmed before hard-coding this: grepped the whole app for `isSystemInDarkTheme` and
+// for any call site passing `GudumapTheme(darkTheme = ...)` -- the only hit for either was
+// this file's own old default parameter, and `MainActivity.kt`'s sole call site
+// (`GudumapTheme { ... }`) never overrode it. Color.kt's old `LightColorScheme` was also
+// still the untouched stock Material3 template, never designed against -- so there was no
+// real light-mode experience anyone depended on to preserve.
+//
+// Dynamic (Material You / wallpaper-derived) color support is also deliberately removed
+// here, not just left at its old default: on API 31+ it would replace every color decided
+// in Color.kt with whatever the device wallpaper happens to generate, which defeats the
+// point of a deliberate navy/cyan/violet brand identity for a screening demo.
+private val GudumapDarkColorScheme = darkColorScheme(
+    primary = CyanPrimary,
+    onPrimary = OnCyanPrimary,
+    primaryContainer = CyanPrimaryContainer,
+    onPrimaryContainer = OnCyanPrimaryContainer,
 
-private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
+    secondary = VioletSecondary,
+    onSecondary = OnVioletSecondary,
+    secondaryContainer = VioletSecondaryContainer,
+    onSecondaryContainer = OnVioletSecondaryContainer,
 
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    tertiary = TertiaryPink,
+    onTertiary = OnTertiaryPink,
+    tertiaryContainer = TertiaryPinkContainer,
+    onTertiaryContainer = OnTertiaryPinkContainer,
+
+    background = NavyBase,
+    onBackground = TextPrimary,
+
+    surface = NavySurface,
+    onSurface = TextPrimary,
+    surfaceVariant = NavySurfaceVariant,
+    onSurfaceVariant = TextMuted,
+
+    outline = Outline,
+
+    error = ErrorRed,
+    onError = OnErrorRed,
+    errorContainer = ErrorRedContainer,
+    onErrorContainer = OnErrorRedContainer,
 )
 
 @Composable
 fun GudumapTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
-    }
-
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = GudumapDarkColorScheme,
         typography = Typography,
+        shapes = GudumapShapes,
         content = content
     )
 }

@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 import java.util.Locale
 import kotlin.math.abs
@@ -44,11 +45,24 @@ class NavigationEngine(
     private val locationManager: LocationManager = LocationManager(context),
     val deadReckoningEngine: DeadReckoningEngine = DeadReckoningEngine(),
     private val mapMatcher: MapMatcher = MapMatcher(context),
-    private val offlineMapManager: OfflineMapManager = OfflineMapManager(context)
+    private val offlineMapManager: OfflineMapManager = OfflineMapManager.getInstance(context)
 ) {
 
     companion object {
         private const val TAG = "Gudumap:NavEngine"
+
+        // §60: automatic GPS-loss blackout detection (opt-in, off by default).
+        // Enter dead reckoning when no *good* GPS fix has arrived for this long...
+        private const val AUTO_GPS_LOSS_TIMEOUT_MS = 5_000L
+        // ...where "good" = from the GPS provider (not the cell/Wi-Fi NETWORK_PROVIDER, which
+        // keeps producing coarse fixes inside tunnels/basements) with reported accuracy at or
+        // below this radius...
+        private const val AUTO_GOOD_FIX_MAX_ACCURACY_M = 25f
+        // ...and leave it again only after this many consecutive good fixes, so one lucky fix
+        // at a tunnel mouth doesn't make it flap in and out.
+        private const val AUTO_EXIT_CONSECUTIVE_GOOD_FIXES = 2
+        // Fixes worse than this (or not from the GPS provider) aren't used to score DR error.
+        private const val GROUND_TRUTH_MAX_ACCURACY_M = 50f
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -69,6 +83,17 @@ class NavigationEngine(
     private var isInternetAvailable = true
     private var autoTriggeredByNetworkLoss = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    // §60: automatic GPS-loss blackout state. Only decides *when* to call setBlackoutMode();
+    // nothing here touches the DR/EKF/ML pipeline itself.
+    @Volatile private var autoBlackoutEnabled = false
+    @Volatile private var lastGoodGpsFixMs = 0L
+    @Volatile private var lastGoodGpsLocation: Location? = null
+    @Volatile private var autoTriggeredByGpsLoss = false
+    @Volatile private var autoSuppressedUntilGoodFix = false
+    private var consecutiveGoodFixesWhileAuto = 0
+    @Volatile private var lastUsableGpsLocation: Location? = null
+    @Volatile private var lastUsableGpsFixMs = 0L
 
     // Blackout tracking fields
     private var blackoutStartTimeMs = 0L
@@ -105,6 +130,8 @@ class NavigationEngine(
 
     fun start() {
         Log.i(TAG, "Starting Gudumap Navigation Engine...")
+        // §60: offline map copy/verify off the main thread (shared with MapView; runs once).
+        scope.launch(Dispatchers.IO) { offlineMapManager.ensureInitialized() }
         deadReckoningEngine.initializeAssets(context)
         startSensors()
         startLocationListening()
@@ -172,6 +199,9 @@ class NavigationEngine(
      */
     fun resume() {
         Log.i(TAG, "Resuming Gudumap Navigation Engine (re-registering sensors)")
+        // §60: no fixes arrive while paused -- give GPS a fresh grace period instead of letting
+        // the GPS-loss detector fire the instant sensors come back.
+        if (lastGoodGpsFixMs != 0L) lastGoodGpsFixMs = System.currentTimeMillis()
         startSensors()
         retryLocationUpdatesIfNeeded()
     }
@@ -308,6 +338,7 @@ class NavigationEngine(
         )
         deadReckoningEngine.addSensorSample(imuSample)
 
+        checkGpsLossWatchdog()
         emitThrottledState()
     }
 
@@ -323,6 +354,31 @@ class NavigationEngine(
                 "hasGpsFix will become true, lat=${location.latitude} lon=${location.longitude}")
         }
 
+        // §60: GPS-loss detector bookkeeping + automatic exit. Runs before the mode switch below
+        // so that, when this fix ends an auto-triggered blackout, it is handled by the normal
+        // GNSS_RECOVERY branch exactly like a manual end would be.
+        val goodFix = isGoodGpsFix(location)
+        if (location.provider == "gps" &&
+            (!location.hasAccuracy() || location.accuracy <= GROUND_TRUTH_MAX_ACCURACY_M)
+        ) {
+            lastUsableGpsLocation = location
+            lastUsableGpsFixMs = System.currentTimeMillis()
+        }
+        if (goodFix) {
+            lastGoodGpsFixMs = System.currentTimeMillis()
+            lastGoodGpsLocation = location
+            autoSuppressedUntilGoodFix = false
+        }
+        if (autoTriggeredByGpsLoss && blackoutActive) {
+            consecutiveGoodFixesWhileAuto = if (goodFix) consecutiveGoodFixesWhileAuto + 1 else 0
+            if (consecutiveGoodFixesWhileAuto >= AUTO_EXIT_CONSECUTIVE_GOOD_FIXES) {
+                Log.i(TAG, "Auto blackout: $consecutiveGoodFixesWhileAuto consecutive good GPS fixes -- ending automatically")
+                autoTriggeredByGpsLoss = false
+                consecutiveGoodFixesWhileAuto = 0
+                setBlackoutMode(false, isAutomatic = true)
+            }
+        }
+
         when (gnssNavMode) {
             "GNSS_AVAILABLE" -> {
                 deadReckoningEngine.correctWithGnss(location)
@@ -330,6 +386,19 @@ class NavigationEngine(
             "GNSS_BLACKOUT" -> {
                 // Blackout Active: Do NOT feed GNSS into DR/EKF.
                 Log.i("GUDUMAP_BLACKOUT", String.format(Locale.US, "GNSS_GROUND_TRUTH: lat=%.6f lon=%.6f", location.latitude, location.longitude))
+
+                // §60: only score DR against *good* GPS fixes. NETWORK_PROVIDER fixes (cell/Wi-Fi,
+                // often 100 m+ off, and exactly what keeps arriving inside a tunnel) were also
+                // being used as "ground truth", inflating Max Error / drift with the reference's
+                // own error rather than dead reckoning's.
+                // Looser than the detector's 25 m "good fix" bar (50 m, GPS provider only), so indoor
+                // manual demos with mediocre GPS still get scored.
+                val usableAsTruth = location.provider == "gps" &&
+                    (!location.hasAccuracy() || location.accuracy <= GROUND_TRUTH_MAX_ACCURACY_M)
+                if (!usableAsTruth) {
+                    emitThrottledState(force = true)
+                    return
+                }
 
                 val drState = deadReckoningEngine.getState()
                 val posErr = CoordinateTransformer.computeDistanceBetween(
@@ -379,11 +448,16 @@ class NavigationEngine(
      * internet returns (§27's disclosed edge case, closed here). Automatic calls skip this
      * reset -- they manage the flag themselves, immediately before/after calling this function.
      */
-    fun setBlackoutMode(enabled: Boolean, isAutomatic: Boolean = false) {
+    fun setBlackoutMode(enabled: Boolean, isAutomatic: Boolean = false, anchorOverride: Location? = null) {
         if (enabled == blackoutActive) return
 
         if (!isAutomatic) {
             autoTriggeredByNetworkLoss = false
+            // §60: same rule for the GPS-loss detector. And if a person ends a blackout by hand
+            // while GPS is still missing, don't let the detector immediately start it again --
+            // wait until a real good fix has been seen first.
+            autoTriggeredByGpsLoss = false
+            if (!enabled) autoSuppressedUntilGoodFix = true
         }
 
         if (enabled) {
@@ -402,7 +476,9 @@ class NavigationEngine(
             gnssNavMode = "GNSS_BLACKOUT"
 
             // Guaranteed non-null past the guard above -- no fallback to any default here.
-            val gnssAtEntry = latestRawGnssLocation!!
+            // §60: the GPS-loss detector passes the last *good* GPS fix as the anchor, because by
+            // the time it fires latestRawGnssLocation may be a coarse NETWORK_PROVIDER fix.
+            val gnssAtEntry = anchorOverride ?: latestRawGnssLocation!!
             blackoutStartLat = gnssAtEntry.latitude
             blackoutStartLon = gnssAtEntry.longitude
             blackoutStartHeading = gnssAtEntry.bearing
@@ -415,7 +491,6 @@ class NavigationEngine(
                 gnssAtEntry.elapsedRealtimeNanos
             ) ?: 0f
             blackoutStartTimeMs = System.currentTimeMillis()
-            blackoutStartDist = deadReckoningEngine.distanceTravelled
 
             blackoutStationaryDurationSec = 0.0
             blackoutRotatingDurationSec = 0.0
@@ -434,6 +509,12 @@ class NavigationEngine(
                 speedMps = blackoutStartSpeed,
                 bearingDeg = blackoutStartHeading
             )
+            // Must be read AFTER initialize(): it calls trajectoryIntegrator.reset(), zeroing the
+            // running total. Snapshotting before the reset left a stale pre-blackout total (the
+            // GNSS-fed distance since §51) as the baseline, so drDist = max(0, total - stale)
+            // stayed 0.0 until the new total exceeded it (observed on device: 6.91 m stale vs
+            // 3.7 m peak, DR Distance 0.0 m for the whole 49.5 s blackout).
+            blackoutStartDist = deadReckoningEngine.distanceTravelled
             deadReckoningEngine.setBlackoutMode(true)
 
             val liveMetrics = BlackoutMetrics(
@@ -460,6 +541,9 @@ class NavigationEngine(
                     gnssRecovered = false,
                     positionErrorMeters = 0.0,
                     driftPercentage = 0.0,
+                    // §60: don't carry the previous blackout's last GPS reference point into this one.
+                    gnssGroundTruthLat = null,
+                    gnssGroundTruthLon = null,
                     blackoutMetrics = liveMetrics,
                     blackoutDurationSeconds = 0.0
                 )
@@ -476,7 +560,13 @@ class NavigationEngine(
             val drState = deadReckoningEngine.getState()
             val drDist = max(0.0, drState.distanceTravelled - blackoutStartDist)
 
-            val recoveryGps = latestRawGnssLocation
+            // §60: prefer the most recent *good* GPS fix (if it's fresh) as the recovery reference,
+            // for the same reason ground-truth scoring above skips network fixes.
+            val nowMsForRecovery = System.currentTimeMillis()
+            val recoveryGps = lastGoodGpsLocation
+                ?.takeIf { nowMsForRecovery - lastGoodGpsFixMs < 10_000L }
+                ?: lastUsableGpsLocation?.takeIf { nowMsForRecovery - lastUsableGpsFixMs < 10_000L }
+                ?: latestRawGnssLocation
             val endGnssLat = recoveryGps?.latitude ?: drState.latitude
             val endGnssLon = recoveryGps?.longitude ?: drState.longitude
 
@@ -557,6 +647,61 @@ class NavigationEngine(
 
     fun toggleBlackout() {
         setBlackoutMode(!blackoutActive)
+    }
+
+    /** §60: turn the automatic GPS-loss blackout detector on or off (UI toggle). */
+    fun setAutoBlackoutEnabled(enabled: Boolean) {
+        autoBlackoutEnabled = enabled
+        autoSuppressedUntilGoodFix = false
+        // Grace period from the moment it's switched on, same as resume() gives.
+        if (enabled && lastGoodGpsFixMs != 0L) lastGoodGpsFixMs = System.currentTimeMillis()
+        Log.i(TAG, "Auto GPS-loss blackout detection ${if (enabled) "ENABLED" else "DISABLED"}")
+        emitThrottledState(force = true)
+    }
+
+    private fun isGoodGpsFix(location: Location): Boolean =
+        location.provider == "gps" && location.hasAccuracy() && location.accuracy <= AUTO_GOOD_FIX_MAX_ACCURACY_M
+
+    /**
+     * §60: called on every sensor step (cheap early-outs first). Starts an automatic blackout
+     * when the detector is enabled, we're in plain GNSS mode (not already blacked out, not
+     * mid-recovery), a good GPS fix has been seen this session, and none has arrived for
+     * [AUTO_GPS_LOSS_TIMEOUT_MS]. Anchors at the last good fix -- which is up to that timeout
+     * old, a disclosed limitation of detecting loss by absence.
+     */
+    private fun checkGpsLossWatchdog() {
+        if (!autoBlackoutEnabled || blackoutActive || autoSuppressedUntilGoodFix) return
+        if (gnssNavMode != "GNSS_AVAILABLE") return
+        val anchor = lastGoodGpsLocation ?: return
+        val now = System.currentTimeMillis()
+
+        // GPS updates are requested with a 1 m minimum distance (LocationManager), so a phone
+        // standing still legitimately stops receiving fixes. Silence while stationary is not
+        // "GPS lost" -- keep the timer fresh. (Trade-off: if GPS really did die while standing
+        // still, detection starts counting only once movement resumes. The anchor stays correct
+        // either way, since nothing moved.)
+        // (Cheap time check first -- this runs on every sensor step.)
+        if (now - lastGoodGpsFixMs < AUTO_GPS_LOSS_TIMEOUT_MS) return
+        if (deadReckoningEngine.getState().isStationary) {
+            lastGoodGpsFixMs = now
+            return
+        }
+
+        val silentForMs = now - lastGoodGpsFixMs
+
+        // Never anchor dead reckoning to a fix that's far older than the detection timeout
+        // (e.g. GPS already lost long before this check could run) -- wait for a fresh fix.
+        if (silentForMs > AUTO_GPS_LOSS_TIMEOUT_MS + 10_000L) {
+            autoSuppressedUntilGoodFix = true
+            Log.w(TAG, "Auto blackout: last good fix is ${silentForMs} ms old -- too stale to anchor; waiting for a fresh fix")
+            return
+        }
+
+        Log.i(TAG, "Auto blackout: no good GPS fix for ${silentForMs} ms while moving -- entering dead reckoning automatically")
+        autoTriggeredByGpsLoss = true
+        consecutiveGoodFixesWhileAuto = 0
+        setBlackoutMode(true, isAutomatic = true, anchorOverride = anchor)
+        if (!blackoutActive) autoTriggeredByGpsLoss = false
     }
 
     private fun emitThrottledState(force: Boolean = false) {
@@ -676,6 +821,14 @@ class NavigationEngine(
                 headingConfidence = headingConfidenceStr,
                 motionMode = drState.motionMode,
                 isInternetAvailable = isInternetAvailable,
+                autoBlackoutEnabled = autoBlackoutEnabled,
+                blackoutAutoTriggered = blackoutActive && autoTriggeredByGpsLoss,
+                blackoutAutoReason = when {
+                    !blackoutActive -> ""
+                    autoTriggeredByGpsLoss -> "GPS_LOSS"
+                    autoTriggeredByNetworkLoss -> "NETWORK_LOSS"
+                    else -> ""
+                },
                 timestampNs = System.nanoTime()
             )
         }

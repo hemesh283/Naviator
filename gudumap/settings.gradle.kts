@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "gudumap"
+rootProject.name = "Naviator"
 include(":app")

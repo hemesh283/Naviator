@@ -1,9 +1,14 @@
 """Comprehensive Statistical Analysis and Aggregation for IO-VNBD Audit.
 
 Computes:
-1. Full 7-baseline aggregate table (all 32 evaluations).
+1. Full 9-baseline aggregate table (all 32 evaluations) -- Baselines 1-7 plus
+   Baseline 8 (ML + Kinematic Gate + EKF + NHC + ZUPT, a faithful port of
+   DeadReckoningEngine.kt's ML kinematic plausibility gate) and Baseline 9
+   (INS + EKF + NHC + ZUPT, no ML at all -- isolates whether NHC/ZUPT help
+   without any ML displacement in the loop).
 2. Moving-only aggregate table (distance_travelled_m > 100 m).
-3. B3 (ML Only), B4 (ML+INS), B5 (ML+INS+EKF) breakdown (<10%, <15%, <20%, median, mean, P95).
+3. B3 (ML Only), B4 (ML+INS), B5 (ML+INS+EKF), B8 (ML+Gate+EKF+NHC+ZUPT)
+   breakdown (<10%, <15%, <20%, median, mean, P95).
 4. Best baseline determination per outage duration.
 5. Claims verification against raw CSV (8a through 8f).
 6. 120s moving sequence metrics (best, worst, median, mean, P95).
@@ -31,7 +36,10 @@ def run_audit_analysis():
     print(f"RAW BENCHMARK CSV AUDIT: {len(df)} total rows")
     print("=" * 80)
 
-    # 1. Verification of 224 evaluations
+    # 1. Verification of evaluations. 9 baselines x 32 evaluations = 288 rows since
+    # BASELINE 9: INS + EKF + NHC + ZUPT (no ML) was added (isolates whether
+    # NHC/ZUPT help without any ML displacement at all) alongside the original
+    # 8, which are unchanged.
     baselines = [
         "BASELINE 1: Pure INS",
         "BASELINE 2: INS + EKF",
@@ -40,14 +48,16 @@ def run_audit_analysis():
         "BASELINE 5: ML + INS + EKF",
         "BASELINE 6: ML + INS + EKF + NHC",
         "BASELINE 7: ML + INS + EKF + NHC + ZUPT",
+        "BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT",
+        "BASELINE 9: INS + EKF + NHC + ZUPT (no ML)",
     ]
-    assert len(df) == 224, f"Expected 224 rows, got {len(df)}"
+    assert len(df) == 288, f"Expected 288 rows (9 baselines x 32), got {len(df)}"
     for b in baselines:
         count = len(df[df["baseline_name"] == b])
         assert count == 32, f"Baseline {b} has {count} rows, expected 32"
-    print("Task 1 & 2 Verified: Exactly 224 evaluations across all 7 baselines (32 evaluations each).\n")
+    print("Task 1 & 2 Verified: Exactly 288 evaluations across all 9 baselines (32 evaluations each).\n")
 
-    # 2. Comprehensive 7-Baseline Aggregate Table (All 32 evaluations)
+    # 2. Comprehensive 9-Baseline Aggregate Table (All 32 evaluations)
     outage_durations = [10.0, 30.0, 60.0, 120.0]
     agg_all = []
     for dur in outage_durations:
@@ -79,7 +89,7 @@ def run_audit_analysis():
 
     df_agg_all = pd.DataFrame(agg_all)
     df_agg_all.to_csv(RESULTS_DIR / "real_benchmark_aggregate.csv", index=False)
-    print("Task 3 Completed: Saved updated real_benchmark_aggregate.csv with all 7 baselines.")
+    print("Task 3 Completed: Saved updated real_benchmark_aggregate.csv with all 9 baselines.")
 
     # 3. Moving Sequences Aggregate Table (distance_travelled_m > 100 m)
     df_moving = df[df["distance_travelled_m"] > 100.0].copy()
@@ -122,7 +132,14 @@ def run_audit_analysis():
     print("TASKS 5 & 6: B3 (ML Only), B4 (ML+INS), B5 (ML+INS+EKF) THRESHOLD BREAKDOWN")
     print("=" * 80)
 
-    for b_code, b_name in [("B3", "BASELINE 3: ML Only"), ("B4", "BASELINE 4: ML + INS"), ("B5", "BASELINE 5: ML + INS + EKF")]:
+    for b_code, b_name in [
+        ("B2", "BASELINE 2: INS + EKF"),
+        ("B3", "BASELINE 3: ML Only"),
+        ("B4", "BASELINE 4: ML + INS"),
+        ("B5", "BASELINE 5: ML + INS + EKF"),
+        ("B8", "BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT"),
+        ("B9", "BASELINE 9: INS + EKF + NHC + ZUPT (no ML)"),
+    ]:
         sub_all = df[df["baseline_name"] == b_name]
         sub_mov = df_moving[df_moving["baseline_name"] == b_name]
 

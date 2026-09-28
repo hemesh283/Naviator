@@ -43,5 +43,8 @@ data class NavigationState(
     val motionMode: String = "VEHICLE_MODE", // "VEHICLE_MODE" / "CONSERVATIVE_MODE" -- pedestrian-safe fallback classification, decided once at blackout entry (PROJECT_STATUS.md §24); UI hookup pending
     val hasGpsFix: Boolean = false, // true once at least one real GNSS fix has ever been obtained this session
     val isInternetAvailable: Boolean = true, // true when device has active internet, false when offline (merged back from teammate's branch, PROJECT_STATUS.md §26; not yet wired to any producer on this branch -- see NavigationEngine.kt merge decision)
+    val autoBlackoutEnabled: Boolean = false, // §60: opt-in "enter dead reckoning automatically when real GPS is lost"
+    val blackoutAutoTriggered: Boolean = false, // §60: true while the current blackout was started by that GPS-loss detector
+    val blackoutAutoReason: String = "", // §60: "GPS_LOSS" / "NETWORK_LOSS" (the older internet-loss trigger) / "" = manual
     val timestampNs: Long = System.nanoTime()
 )

@@ -1,5 +1,6 @@
 package com.example.gudumap.navigation
 
+import android.util.Log
 import com.example.gudumap.sensor.ImuSample
 import kotlin.math.sqrt
 
@@ -8,6 +9,8 @@ enum class NavMotionState {
     ROTATING_IN_PLACE,
     MOVING
 }
+
+private const val TAG = "Gudumap:ZuptDetector"
 
 /**
  * Multi-signal Stationary & In-Place Rotation Detector for Zero-Velocity Updates (ZUPT).
@@ -35,7 +38,23 @@ class ZuptDetector(
     var gyroMagnitudeThreshold: Float = 0.10f,         // rad/s
     var gyroVarianceThreshold: Float = 0.01f,          // (rad/s)^2
     var gnssSpeedThreshold: Float = 0.30f,             // m/s
-    var minConsecutiveSamples: Int = 4,                // consecutive stationary samples (~400ms at 10 Hz)
+    // §52: these used to be raw sample COUNTS (`minConsecutiveSamples = 4, "~400ms at 10Hz"`),
+    // but `update()` is actually driven by `DeadReckoningEngine.addSensorSample()`, which itself
+    // runs once per raw accelerometer OR gyroscope callback (`NavigationEngine.onSensorStep()`,
+    // both registered at `SENSOR_DELAY_GAME` -- roughly 50Hz each, so combined this runs far
+    // closer to ~100Hz than the assumed 10Hz). 4 samples was therefore actually confirming
+    // stillness after roughly 40-80ms of low readings, not the intended 400ms. A single
+    // pedestrian stride's brief low-acceleration moment (between a step's propulsion and
+    // braking phases) comfortably fits inside 40-80ms -- which is exactly what let a phone
+    // carried steadily while walking latch into STATIONARY and stay there (confirmed live: a
+    // blackout-mode test session showing the app's own "Motion: STATIONARY" indicator and
+    // "DR Distance: 0.0 m" the entire time the person was actually walking). Switched to real
+    // elapsed time, measured from each sample's own timestamp, so the confirmation window is
+    // whatever duration it says regardless of actual callback rate -- this restores the
+    // originally documented/intended ~400ms debounce instead of guessing a new one, and applies
+    // equally to vehicle mode (making its debounce more correct too, not just pedestrian mode).
+    var minStationaryDurationMs: Float = 400f,
+    var minRotatingDurationMs: Float = 200f,
     private val historyWindowSize: Int = 20
 ) {
 
@@ -45,8 +64,10 @@ class ZuptDetector(
     private var historyCount = 0
     private var historyIndex = 0
 
-    private var consecutiveStationaryCount = 0
-    private var consecutiveRotatingCount = 0
+    // 0L = "not currently inside this condition" -- real sample timestamps (System.nanoTime()
+    // via ImuSample.timestampNs) are never actually 0 in practice, so this sentinel is safe.
+    private var stationaryConditionStartNs = 0L
+    private var rotatingConditionStartNs = 0L
     private var isStationaryState = false
 
     var motionState: NavMotionState = NavMotionState.STATIONARY
@@ -63,8 +84,8 @@ class ZuptDetector(
         if (!isEnabled) {
             isStationaryState = false
             motionState = NavMotionState.MOVING
-            consecutiveStationaryCount = 0
-            consecutiveRotatingCount = 0
+            stationaryConditionStartNs = 0L
+            rotatingConditionStartNs = 0L
             return false
         }
 
@@ -99,25 +120,43 @@ class ZuptDetector(
         val horizAccLow = (accHoriz < horizontalAccThreshold) && (accHorizVar < horizontalAccVarianceThreshold)
         val instantRotatingInPlace = gyroActive && horizAccLow && gnssCondition
 
+        val previousMotionState = motionState
+
         if (instantStationary) {
-            consecutiveStationaryCount++
-            consecutiveRotatingCount = 0
-            if (consecutiveStationaryCount >= minConsecutiveSamples) {
+            if (stationaryConditionStartNs == 0L) stationaryConditionStartNs = sample.timestampNs
+            rotatingConditionStartNs = 0L
+            val elapsedMs = (sample.timestampNs - stationaryConditionStartNs) / 1_000_000f
+            if (elapsedMs >= minStationaryDurationMs) {
                 motionState = NavMotionState.STATIONARY
                 isStationaryState = true
             }
         } else if (instantRotatingInPlace) {
-            consecutiveRotatingCount++
-            consecutiveStationaryCount = 0
-            if (consecutiveRotatingCount >= 2) {
+            if (rotatingConditionStartNs == 0L) rotatingConditionStartNs = sample.timestampNs
+            stationaryConditionStartNs = 0L
+            val elapsedMs = (sample.timestampNs - rotatingConditionStartNs) / 1_000_000f
+            if (elapsedMs >= minRotatingDurationMs) {
                 motionState = NavMotionState.ROTATING_IN_PLACE
                 isStationaryState = false
             }
         } else {
-            consecutiveStationaryCount = 0
-            consecutiveRotatingCount = 0
+            stationaryConditionStartNs = 0L
+            rotatingConditionStartNs = 0L
             motionState = NavMotionState.MOVING
             isStationaryState = false
+        }
+
+        // §52: log every motionState transition (not every sample -- this fires only on
+        // change, so it won't flood Logcat) with the exact values that caused it. Filter
+        // Logcat on tag "Gudumap:ZuptDetector" to watch this live during a walking test --
+        // if STATIONARY still gets latched into during genuine walking after this fix, these
+        // numbers are the ground truth for re-tuning the thresholds above, instead of guessing.
+        if (motionState != previousMotionState) {
+            Log.i(
+                TAG,
+                "motionState ${previousMotionState.name} -> ${motionState.name} | " +
+                    "accMag=$accMag accVar=$accVar horizAcc=$accHoriz horizVar=$accHorizVar " +
+                    "gyroMag=$gyroMag gyroVar=$gyroVar gnssSpeed=$gnssSpeed"
+            )
         }
 
         return isStationaryState
@@ -150,8 +189,8 @@ class ZuptDetector(
     fun reset() {
         historyCount = 0
         historyIndex = 0
-        consecutiveStationaryCount = 0
-        consecutiveRotatingCount = 0
+        stationaryConditionStartNs = 0L
+        rotatingConditionStartNs = 0L
         isStationaryState = false
         motionState = NavMotionState.STATIONARY
     }

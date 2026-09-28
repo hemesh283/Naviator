@@ -6,18 +6,22 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+// §52/§61: ZuptDetector confirms stillness by real elapsed time (sample timestamps), not by a
+// sample count, so these tests use a duration (samples here are 10 ms apart: 50 ms ≈ the old
+// "5 consecutive samples"). Timestamps start at 10 ms because 0 is the detector's own
+// "condition not started yet" sentinel.
 class ZuptDetectorTest {
 
     @Test
     fun testDetectsStationaryWithMultiSignalCombination() {
         val detector = ZuptDetector(
-            minConsecutiveSamples = 5
+            minStationaryDurationMs = 50f
         )
 
         // Feed quiet sensor samples (low accel magnitude & variance, low gyro magnitude & variance)
         for (i in 0 until 15) {
             val sample = ImuSample(
-                timestampNs = i * 10_000_000L,
+                timestampNs = (i + 1) * 10_000_000L,
                 ax = 0.01f,
                 ay = 0.01f,
                 az = 0.01f,
@@ -34,14 +38,14 @@ class ZuptDetectorTest {
     @Test
     fun testRejectsStationaryWhenGyroscopeIsActive() {
         val detector = ZuptDetector(
-            minConsecutiveSamples = 5,
+            minStationaryDurationMs = 50f,
             gyroMagnitudeThreshold = 0.10f
         )
 
         // Accel is low, but phone is rotating (gyro is high)
         for (i in 0 until 15) {
             val sample = ImuSample(
-                timestampNs = i * 10_000_000L,
+                timestampNs = (i + 1) * 10_000_000L,
                 ax = 0.01f,
                 ay = 0.01f,
                 az = 0.01f,
@@ -58,14 +62,14 @@ class ZuptDetectorTest {
     @Test
     fun testRejectsStationaryWhenGnssSpeedIsHigh() {
         val detector = ZuptDetector(
-            minConsecutiveSamples = 5,
+            minStationaryDurationMs = 50f,
             gnssSpeedThreshold = 0.30f
         )
 
         // Sensors quiet, but vehicle is cruising at 15 m/s
         for (i in 0 until 15) {
             val sample = ImuSample(
-                timestampNs = i * 10_000_000L,
+                timestampNs = (i + 1) * 10_000_000L,
                 ax = 0.01f,
                 ay = 0.01f,
                 az = 0.01f,
@@ -82,13 +86,13 @@ class ZuptDetectorTest {
     @Test
     fun testEnableDisableModularity() {
         val detector = ZuptDetector(
-            minConsecutiveSamples = 3
+            minStationaryDurationMs = 30f
         )
 
         // Feed quiet samples
         for (i in 0 until 10) {
             detector.update(
-                ImuSample(i * 10_000_000L, 0f, 0f, 0f, 0f, 0f, 0f),
+                ImuSample((i + 1) * 10_000_000L, 0f, 0f, 0f, 0f, 0f, 0f),
                 gnssSpeed = 0f
             )
         }

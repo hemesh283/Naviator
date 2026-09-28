@@ -1312,3 +1312,1074 @@ Confirmed via a whitespace/line-ending-insensitive `diff` directly against the t
 ### Still not build-tested
 
 Same standing caveat as every session. Needs an Android Studio sync and an on-device pass checking specifically: all six layout sections render in the right order and states; the Motion Mode badge appears only during blackout and switches between "🚗 Vehicle Mode" and "🚶 Conservative Mode" correctly across a vehicle-speed test and a walking test (the two scenarios §24's classifier was designed to distinguish); the full-screen map expand/shrink still works via MapView's own floating button with the drawer-opening hamburger removed; and the technical details section's new Internet row reflects real connectivity changes once the `NavigationEngine.kt` auto-blackout feature (§27) is exercised.
+
+## 31. 2026-09-08 — ground-truth heading was leaking into every simulated GNSS outage; frozen at the outage-entry value in both evaluation scripts
+
+*(Logged retroactively on 2026-09-13, while documenting the Baseline 8 work below, after a full-file search of this log turned up no existing entry for it. The account below describes the fix as it was made on 2026-09-08 — only the write-up itself is late.)*
+
+Every baseline evaluated by `src/evaluation/run_all_test_sequences_benchmark.py` and `src/evaluation/baseline_ladder.py` needs a heading to rotate a body-frame or ML displacement estimate into the NED frame during a simulated GPS blackout. Both scripts were getting that heading by reading `seq.gt_hdg[i]` (`run_all_test_sequences_benchmark.py`) / `stream.gnss_hdg_100hz[i]` (`baseline_ladder.py`) live, sample-by-sample, for the entire duration of whatever outage window was being evaluated — i.e., asking the *withheld* GNSS/ground-truth stream what the true heading was at each instant *inside* the blackout the evaluation was supposed to be blind to. A GNSS-denied dead-reckoning evaluation that quietly consults GNSS-derived heading mid-outage isn't evaluating GNSS-denial; it's leaking part of the answer into the estimate and then scoring the estimate as if it had earned it honestly.
+
+### The fix
+
+Freeze heading at its last known-good, pre-outage value for the full duration of the outage, instead of reading it live:
+
+- `run_all_test_sequences_benchmark.py`: `hdg0 = float(seq.gt_hdg[init_idx])` is captured once at outage entry; every rotation inside the outage window then uses `R_bn0 = CoordinateTransformer.heading_to_dcm(hdg0)` instead of a per-sample lookup.
+- `baseline_ladder.py`: a new `_compute_effective_heading(gnss_hdg_100hz, gnss_mask)` helper — a single forward pass producing, in its own docstring's words, a "heading stream with the GNSS-outage leak removed" — holds the heading at the last-known-good sample for as long as `gnss_mask` says the outage is ongoing. Wired in as `eff_hdg = _compute_effective_heading(stream.gnss_hdg_100hz, gnss_mask)`, replacing every prior direct read of `stream.gnss_hdg_100hz[i]`.
+
+Both files carry inline comments at the fix site naming the bug in almost the same words as this entry. `run_all_test_sequences_benchmark.py`: "BUG FIX: every baseline below used to read seq.gt_hdg[i] -- ... so this was leaking the answer straight into every one of the [outages]" and "Fix: freeze heading at hdg0 (the last known-good value at [outage entry])". `baseline_ladder.py`'s docstring: "silently leaking the withheld ground-truth heading into every 'GNSS-denied' [outage]" and "Fix: freeze heading at its last known-good (pre-outage) GNSS value for [the outage duration]", with a "was: stream.gnss_hdg_100hz[i] -- leaked real GNSS heading during outages" comment left at the old call site as a marker of what used to be there.
+
+### Verified, not assumed
+
+Grepped both files directly to confirm the fix is real, wired-in code, not just a comment describing an intention:
+
+```
+run_all_test_sequences_benchmark.py:362:  hdg0 = float(seq.gt_hdg[init_idx])
+run_all_test_sequences_benchmark.py:389:  R_bn0 = CoordinateTransformer.heading_to_dcm(hdg0)
+run_all_test_sequences_benchmark.py:466:  R_bn0 = CoordinateTransformer.heading_to_dcm(hdg0)
+
+baseline_ladder.py:62:   def _compute_effective_heading(gnss_hdg_100hz, gnss_mask) -> np.ndarray:
+baseline_ladder.py:171:  eff_hdg = _compute_effective_heading(stream.gnss_hdg_100hz, gnss_mask)
+```
+
+### Still not verified
+
+This entry documents that the leak was found and fixed, not that its downstream effect on the published comparison numbers was ever separately quantified — there is no retained "with-leak" run kept around to show exactly how much the leak had been inflating any baseline's apparent performance before the fix. It also doesn't establish that heading was the *only* place ground truth could leak into an outage evaluation; no broader audit for other similar leaks was performed as part of this fix.
+
+## 32. 2026-09-13 — ported the Android app's real ML kinematic plausibility gate into the Python benchmark as Baseline 8; gating barely moves the number, physics-only still wins every duration
+
+`gudumap`'s real, deployed dead-reckoning engine (`DeadReckoningEngine.kt`) does not trust every ML displacement prediction as-is: `processWindowInference()` runs each one through an accept/clamp/reject kinematic plausibility gate before it's allowed to update position, built specifically to fix a prior runaway-prediction bug (§11). The Python evaluation pipeline that produces this project's published `results/io_vnbd/real_benchmark_aggregate.csv` had no equivalent gate anywhere in it — every prior "ML" baseline (3 through 7) fed raw ML output straight into the fusion chain. That means the benchmark had been validating a different, ungated algorithm from the one actually shipping in the app. This session ports the real gate into the benchmark, faithfully, and measures — nothing more.
+
+### The gate, ported faithfully
+
+Read `DeadReckoningEngine.kt` in full to extract the vehicle-mode gate logic exactly as it exists in the shipping app (lines ~608-693 of `processWindowInference()`), and carried the same constants and formula into Python, once per ML window:
+
+- `MAX_SPEED_CHANGE_MPS2 = 4.0`, `MAX_PLAUSIBLE_SPEED_MPS = 50.0` — bound the speed envelope (`baseSpeed`) growth since blackout entry.
+- `gateTolerance = 1.2` m, clamp tolerance `0.15` m, `effectiveAcc` floor `0.20` m/s².
+- Reject thresholds: `maxHorizAcc < 0.35` and `baseSpeed < 0.30` together with the raw prediction exceeding the plausible envelope.
+- Anything not rejected and not exceeding the envelope passes through unchanged (ACCEPT); anything exceeding it but not meeting the reject thresholds is rescaled down to the envelope plus clamp tolerance (CLAMP).
+
+The three pedestrian-fallback-only constants in the same file (`PEDESTRIAN_SPEED_CEILING_MPS`, `VEHICLE_SPEED_LOOKBACK_SEC`, `PEDESTRIAN_MAX_SPEED_MPS`) were deliberately left out — out of scope for this port, which targets the vehicle-mode gate only.
+
+This was added to `src/evaluation/run_all_test_sequences_benchmark.py` — the script actually confirmed (by its own `RESULTS_DIR` and output filenames) to produce this project's real, published CSVs — as a new eighth rung, **"BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT"**, structurally identical to Baseline 7's EKF+NHC+ZUPT loop but consuming a gated displacement array (`step_dp_ned_gated`) instead of Baseline 7's raw `step_dp_ned_outage`. Per-outage gate action tallies (`Gate[A:x C:y R:z]`) were added to the existing per-outage print line so the gate's real behavior could be inspected directly rather than inferred.
+
+The same gate was also ported into `src/evaluation/baseline_ladder.py`, for consistency with the file that mirrors this ladder — a new `_compute_blackout_entry_speed_and_elapsed()` helper and a `_run_baseline_8_gated()` method, wired into `run_all_baselines()`. **This second port was verified to parse and import (`ast.parse()` succeeded; `from src.evaluation.baseline_ladder import BaselineLadderEvaluator, GATE_MAX_SPEED_CHANGE_MPS2` succeeded at the real Python interpreter) but was never actually executed against real data this session.** `baseline_ladder.py` is not imported by `run_all_test_sequences_benchmark.py` — it backs a separate CLI, `run_io_vnbd_benchmark.py`, which was not invoked this session. Re-confirmed the import is sound (`Tuple` — used in the new helper's return-type annotation — is genuinely imported at line 23: `from typing import Dict, List, Optional, Tuple`), so this is a syntax/import-verified but functionally unexercised port, not a tested one.
+
+`scripts/audit_analysis.py` was updated for 8 baselines instead of 7: the hard row-count assertion changed from 224 to 256, the baseline list and the B3/B4/B5-style threshold-breakdown loop both extended to include Baseline 8, and a leftover "with all 7 baselines" print string corrected to 8.
+
+### Re-ran the real benchmark, regenerated the real CSVs
+
+Re-ran the full IO-VNBD benchmark (real recorded driving data, not synthetic) end-to-end and regenerated `real_benchmark_all_test_sequences.csv`, `real_benchmark_aggregate.csv`, `real_benchmark_aggregate_moving.csv`, `model_comparison_by_sequence.csv`, and `all_sequences_drift_summary.png`. Counted rows directly against the regenerated `real_benchmark_all_test_sequences.csv` with a `csv.DictReader` grouped by `baseline_name` (not assumed from the prior session's report):
+
+```
+total rows: 256
+32 BASELINE 1: Pure INS
+32 BASELINE 2: INS + EKF
+32 BASELINE 3: ML Only
+32 BASELINE 4: ML + INS
+32 BASELINE 5: ML + INS + EKF
+32 BASELINE 6: ML + INS + EKF + NHC
+32 BASELINE 7: ML + INS + EKF + NHC + ZUPT
+32 BASELINE 8: ML + Kinematic Gate + EKF + NHC + ZUPT
+```
+
+256 total, exactly 32 per baseline across all 8 — matches `audit_analysis.py`'s updated assertion, and `audit_analysis.py` itself re-ran clean (exit code 0): "Task 1 & 2 Verified: Exactly 256 evaluations across all 8 baselines (32 evaluations each)."
+
+### The honest result: physics-only still wins, every duration
+
+Median endpoint drift %, re-pulled directly from the regenerated `real_benchmark_aggregate.csv` (`drift_median`, itself computed from the per-window `drift_percent_endpoint` column), physics-only (Baseline 2) vs. ungated ML (Baseline 7) vs. gated ML (Baseline 8):
+
+| Outage | B2: INS+EKF (physics only) | B7: ML+INS+EKF+NHC+ZUPT (ungated) | B8: ML+Gate+EKF+NHC+ZUPT (gated) | B8 vs B7 |
+|---|---|---|---|---|
+| 10s  | 13.0% | 35.4% | 35.7% | +0.3 pp (worse) |
+| 30s  | 34.4% | 46.4% | 45.8% | −0.6 pp (better) |
+| 60s  | 30.4% | 31.7% | 31.8% | +0.1 pp (worse) |
+| 120s | 43.0% | 60.2% | 59.4% | −0.8 pp (better) |
+
+**Baseline 2 (plain physics, no ML at all) wins at every single duration**, by a wide margin — roughly 2-3x lower median drift than either ML variant at every outage length. Gating's effect on Baseline 8 relative to ungated Baseline 7 is small and **inconsistent in direction** — sometimes fractionally better (30s, 120s), sometimes fractionally worse (10s, 60s), never by more than about 0.8 percentage points either way. This is worth flagging plainly: the task brief going into this session estimated the gating effect at "roughly 0.6-1.4 percentage points," framed as an improvement; the actual re-pulled numbers show a smaller, mixed-sign effect (−0.8 pp to +0.3 pp) that doesn't consistently move in one direction at all. Trusting the regenerated CSV over that estimate. Either way, gating comes nowhere close to closing the gap to Baseline 2.
+
+### Why: the gate checks magnitude, not direction
+
+Re-parsed the persisted run log (`/tmp/benchmark_b8_run.log`, from this session's benchmark run) for every per-outage `Gate[A:x C:y R:z]` tally and summed them directly:
+
+```
+ACCEPTED=1637 CLAMPED=74 REJECTED=3 TOTAL=1714
+```
+
+Across 1,714 gated window-evaluations, the gate accepted 1,637 (95.5%) unchanged, clamped 74 (4.3%) to a smaller magnitude, and rejected only 3 (0.2%) outright. This is because the gate — faithfully ported from `DeadReckoningEngine.kt` — validates prediction *magnitude* against a plausible-speed envelope; it has no mechanism to evaluate prediction *direction*. A model that is confidently wrong about which way it's moving, while producing a displacement magnitude that happens to sit inside a generous kinematically-plausible envelope, sails through as ACCEPTED every time. Given that IO-VNBD's ML component is already shown (Baselines 3/4 vs. 1/2, established in earlier sessions) to underperform physics-only integration, and the gate structurally cannot catch a directionally-wrong-but-magnitude-plausible prediction, this result is consistent with what the gate's own design would predict — not a surprise once the accept/clamp/reject split is actually counted rather than assumed.
+
+### What this session deliberately did not do
+
+Thresholds (`gateTolerance`, `MAX_SPEED_CHANGE_MPS2`, the reject cutoffs, etc.) were **not** tuned to chase a better number — this was a faithful port-and-measure of the app's real, shipping gate logic, not an optimization pass. The deployed Android app itself was not modified or rebuilt this session; confirmed via `git diff --stat -- gudumap/app/src/main/java/com/example/gudumap/navigation/DeadReckoningEngine.kt`, which returns **completely empty output** — zero changes to that file.
+
+### Scope discipline
+
+`git status --short` and `git diff --stat`, run fresh against the current repo state:
+
+```
+ M dead_reckoning/results/io_vnbd/all_sequences_drift_summary.png       | Bin 214970 -> 214912 bytes
+ M dead_reckoning/results/io_vnbd/model_comparison_by_sequence.csv      |   2 +-
+ M dead_reckoning/results/io_vnbd/real_benchmark_aggregate.csv          |  60 +--
+ M dead_reckoning/results/io_vnbd/real_benchmark_aggregate_moving.csv   |  60 +--
+ M dead_reckoning/results/io_vnbd/real_benchmark_all_test_sequences.csv | 410 +++++++++++----------
+ M dead_reckoning/scripts/audit_analysis.py                             |  28 +-
+ M dead_reckoning/src/evaluation/baseline_ladder.py                     | 287 ++++++++++++++-
+ M dead_reckoning/src/evaluation/run_all_test_sequences_benchmark.py    | 229 +++++++++++-
+```
+
+That is the complete, exact set of files this session's work touched — 8 files, 794 insertions / 284 deletions in total. Two other items appear in `git status` but are explicitly **not** part of this session's work and are flagged here so they don't get misattributed: `gudumap/app/build.gradle.kts` shows a small pre-existing 2-line diff left over from an earlier, unrelated session (not opened this session); and `dead_reckoning/results/io_vnbd/SIH26168_Screening2_Brief.md` appears as an untracked (`??`) file that was not created by this session's work.
+
+### Still not verified
+
+The gate itself has never been validated against real vehicle data in its own right — it has only ever run either inside the Android app or, as of this session, inside this benchmark; it has never been independently unit-tested against known ground truth in isolation (e.g., feeding it synthetic predictions with known-correct accept/clamp/reject outcomes). And the underlying finding from this and prior sessions — that ML does not beat physics-only integration on this dataset — remains open and unfixed: this session measured it more precisely (now with a gate in the loop, now with an exact accept/clamp/reject tally) but did not change it. No architecture change, retraining, or threshold tuning was attempted or is implied by this entry.
+
+## 33. 2026-09-14 — Baseline 9 (INS + EKF + NHC + ZUPT, no ML) added to test a physics-primary-fusion plan before touching the app; the result contradicts the plan's premise, so the app change was not attempted
+
+With one day left before the screening, and §32 having shown physics-only (Baseline 2) beating every ML-inclusive baseline at every outage duration, the plan going into this session was to make physics-primary fusion — not ML — the default live position estimate in `DeadReckoningEngine.kt`, done as two ordered steps: first confirm cheaply in the Python benchmark that stacking NHC + ZUPT on top of *plain* INS+EKF (with no ML at all) doesn't hurt, then restructure the Android engine's `REJECTED` gate branch to fall back to that same physics combination instead of freezing. Step 2 was explicitly conditioned on Step 1: only proceed if Baseline 9 is not meaningfully worse than Baseline 2 at any duration. **It is meaningfully worse at three of the four durations, so Step 2 was not started.**
+
+### What Step 1 actually did
+
+NHC and ZUPT had never been benchmarked in this project except stacked on top of ML (Baselines 6/7) — there was no existing baseline isolating whether they help *without* ML in the loop at all. Added **"BASELINE 9: INS + EKF + NHC + ZUPT (no ML)"** to `run_all_test_sequences_benchmark.py`, reusing two pieces of already-existing code rather than writing new logic: Baseline 2's own INS-integrated displacement (`dp = v_curr*dt + 0.5*a_ned*dt²`, from frozen-heading-rotated raw accelerometer) as the thing fed into `ekf.predict()`, and Baselines 6/7's own NHC/ZUPT application pattern (`ekf.update_zupt()` gated on `zupt_det.is_stationary(...)`, `ekf.update_nhc()` applied unconditionally every sample) applied on top of it. Added alongside Baselines 1-8 without modifying any of them. `scripts/audit_analysis.py` updated for 9 baselines: row-count assertion 256→288, baseline list extended, and B2/B9 added to the threshold-breakdown loop (previously only B3/B4/B5/B8 were broken out there) specifically so this comparison would be easy to re-run in the future.
+
+Re-ran the full real IO-VNBD benchmark end-to-end (exit code 0) and re-ran `audit_analysis.py` against the regenerated CSV (exit code 0): **"RAW BENCHMARK CSV AUDIT: 288 total rows"** / **"Task 1 & 2 Verified: Exactly 288 evaluations across all 9 baselines (32 evaluations each)."** — confirmed directly from the tool output, not assumed.
+
+### The result: NHC + ZUPT alone make plain physics *worse*, not better, at medium/long outages
+
+Median endpoint drift %, pulled directly from the regenerated `real_benchmark_aggregate.csv`:
+
+| Outage | B2: INS + EKF (no NHC/ZUPT) | B9: INS + EKF + NHC + ZUPT (no ML) | B9 vs B2 |
+|---|---|---|---|
+| 10s  | 13.0% | 12.2% | −0.8 pp (marginally better) |
+| 30s  | 34.4% | 38.2% | +3.8 pp (worse) |
+| 60s  | 30.4% | 53.2% | **+22.8 pp (much worse — ~75% relatively worse)** |
+| 120s | 43.0% | 64.7% | **+21.6 pp (much worse — ~50% relatively worse)** |
+
+This directly contradicts the plan's premise. Adding NHC (non-holonomic constraint: assumes no lateral/vertical velocity) and ZUPT (zero-velocity update on detected stops) on top of plain physics only helps marginally at the shortest outage and actively hurts, substantially, at 60s and 120s — the two durations that matter most for a "handles a real GNSS blackout" story. This is a genuinely new finding: §32 established NHC/ZUPT barely move the needle when stacked on ML (comparing B5→B6→B7's near-identical numbers at every duration in this run's own log), but stacking the identical NHC/ZUPT logic on *plain* INS instead makes it meaningfully worse, not neutral. No investigation into *why* (false-positive ZUPT triggers, an NHC assumption violated by real cornering, something else) was performed — that would be scope creep beyond what was asked; this entry reports the measurement, not a diagnosis of it.
+
+### Per explicit instruction: stopped here
+
+The task was explicit — do not proceed to Step 2 on autopilot if Step 1 contradicts the premise. It does, so `DeadReckoningEngine.kt` was **not modified in this session**: confirmed via `git diff --stat -- gudumap/app/src/main/java/com/example/gudumap/navigation/DeadReckoningEngine.kt`, which returns completely empty output. No restructuring of the app's `REJECTED` gate branch was attempted; §11/§24/§25's existing fixes are entirely untouched.
+
+### Scope discipline
+
+`git diff --stat` for this session's actual changes only (excludes the two flagged unrelated items from §32, which remain as they were):
+
+```
+ dead_reckoning/scripts/audit_analysis.py                             |  33 +-
+ dead_reckoning/src/evaluation/run_all_test_sequences_benchmark.py    | 290 +++++++++++++-
+ dead_reckoning/results/io_vnbd/real_benchmark_all_test_sequences.csv | 442 ++++++++++++---------
+ dead_reckoning/results/io_vnbd/real_benchmark_aggregate.csv          |  64 +--
+ dead_reckoning/results/io_vnbd/real_benchmark_aggregate_moving.csv   |  64 +--
+ dead_reckoning/results/io_vnbd/model_comparison_by_sequence.csv      |   2 +-
+ dead_reckoning/results/io_vnbd/all_sequences_drift_summary.png       | Bin (regenerated)
+```
+
+`gudumap/app/build.gradle.kts`'s pre-existing 2-line diff and the untracked `SIH26168_Screening2_Brief.md` are, as in §32, not part of this session's work.
+
+### Still not verified
+
+Why NHC/ZUPT hurt plain physics at 60s/120s specifically was not investigated — this entry only measured the effect, per the task's own framing of Step 1 as a cheap confirmation gate, not a root-cause pass. No Android code was touched, so there is nothing to build-test in this session — the standing "not build-tested" caveat does not apply here because no Kotlin file changed. The original question this whole two-step plan was meant to answer — what should actually replace the ML-driven default in `DeadReckoningEngine.kt`'s rejected-window path — is now open again: plain Baseline 2 (INS+EKF, no NHC/ZUPT) still beats every ML baseline at every duration per §32, but this session shows the specific "physics + NHC + ZUPT" combination the plan intended to port into the app is worse than plain physics at exactly the durations that matter most, so that specific combination should not be ported as designed without first resolving why it underperforms or reconsidering which physics combination to use instead.
+
+## 34. 2026-09-14 (continued) — DeadReckoningEngine.kt's vehicle-mode ML-REJECTED path now advances by genuine INS physics instead of freezing, matching plain Baseline 2 (no NHC) per the user's explicit decision after §33; build-verification confirmed the sandbox structurally cannot run Gradle here, not that the code compiles
+
+§33 showed Baseline 9 (physics + NHC + ZUPT) is meaningfully worse than plain Baseline 2 at 60s/120s, contradicting the original two-step plan's premise. Presented with that result, the user chose explicitly: use plain Baseline 2 (INS + EKF only, no NHC) as the app's physics-primary fallback instead of Baseline 9 — dropping the NHC-application half of the original Step 2 spec, keeping the rest (restructure the vehicle-mode REJECTED branch to advance via genuine INS instead of freezing).
+
+### Read first, per instruction, before changing anything
+
+Re-read `DeadReckoningEngine.kt`'s full gate section (lines 569-830ish in the pre-session file) and §11/§24/§25 in full. Confirmed the exact mechanism to preserve: `isNavStationary` (any mode) hard-zeros velocity via `ekf.predict([0,0,0],dt)` + `ekf.updateZupt()` + explicit `ekf.state[3..5]=0.0` — unrelated to and untouched by this change. `isPedestrianFallbackActive` (§24/§25) computes its own capped local displacement upstream and must keep skipping NHC via its existing `!isPedestrianFallbackActive` check in the shared `else` branch. The single condition being restructured is `gateAction == GateAction.REJECTED && !isPedestrianFallbackActive` — i.e., vehicle mode, not stationary, ML gate rejected — which previously fell into the *same* zero-and-freeze branch as genuine stillness.
+
+### The fix
+
+Split the previous two-way `if (isNavStationary || (gateAction==REJECTED && !isPedestrianFallbackActive))` into three: `isNavStationary` (unchanged), the new vehicle-REJECTED branch, and the pre-existing `else` (ACCEPTED/CLAMPED/pedestrian, unchanged).
+
+**New private function `integrateInsDisplacementFromEkfVelocity(window)`** (added, ~50 lines): reuses `NaiveIntegrator.kt`'s own world-frame rotation call (`transformer.rotateLocalToWorld(vehAcc, currentHeadingDeg)`) and its `v += a*dt; d += v*dt` recurrence — not reimplemented from scratch, per instruction — but seeds `vNorth`/`vEast` from **`ekf.state[3]`/`ekf.state[4]` (the EKF's own current velocity)** instead of a separate persistent copy. This is a deliberate departure from reusing `NaiveIntegrator`'s own object/state directly: §25 already reasoned through, explicitly, why `NaiveIntegrator`'s own running velocity must never be handed to the real tracked position — it's isolated by design so it can visually demonstrate unbounded naive drift, and feeding its own separately-drifting, never-ZUPT/NHC-corrected velocity into the EKF would introduce exactly the kind of independent, uncorrected error source this project has repeatedly had to fix (§11's whole story). Seeding from `ekf.state[3]/[4]` instead means this displacement continues from whatever the EKF's real, already-corrected velocity is — consistent with how Baseline 2 integrates in Python (`v_curr = ekf.velocity_ned; dp = v_curr*dt + 0.5*a_ned*dt²`), just applied once per 1.0s window (this file's existing granularity for every displacement source) instead of once per 0.1s raw sample. Integrates only the newest `imuBuffer.stride` (10) rows of the window, matching `integrateRawPedestrianDisplacement`'s own newest-samples-only convention (avoids double-counting the 1.0s of samples shared between consecutive overlapping windows).
+
+**New branch** (`gateAction == REJECTED && !isPedestrianFallbackActive`): calls the function above, converts the result to `DoubleArray`, and calls `ekf.predict(insDeltaNedDouble, dt)` directly — **no `nhc.applyConstraint()` call**, matching Baseline 2 exactly per the user's decision (not Baseline 9). The `isNavStationary` branch above it and the `else` branch below it are byte-for-byte unchanged from before this session.
+
+### Trace-through, as instructed
+
+**Scenario: vehicle-mode blackout, not stationary, ML gate rejects this window.** Gate section (untouched): `isNavStationary=false` skips branch 1; `isPedestrianFallbackActive=false` skips branch 2; `modelRunner.ready` branch runs, evaluates `maxHorizAcc<0.35 && baseSpeed<0.30 && rawMag>maxPlausibleDist` as true → `gateAction=REJECTED`, `localDisplacement=[0,0,0]` (same as always — the ML gate's own decision is untouched). EKF-update section: `isNavStationary` false → skip. `gateAction==REJECTED && !isPedestrianFallbackActive` → **true** → new branch runs: `integrateInsDisplacementFromEkfVelocity(window)` reads the EKF's current `state[3]/[4]`, integrates this window's newest 10 accelerometer rows (rotated to NED via `currentHeadingDeg`) on top of that starting velocity, returns a nonzero `[dNorth, dEast, 0]`; `ekf.predict()` is called with that real displacement. **Position advances by a genuine physics-derived amount instead of freezing.** No NHC is applied in this branch.
+
+**Confirmed unchanged, by re-reading the actual resulting code, not just re-deriving it:**
+- `isNavStationary` branch: identical zero-predict + `updateZupt()` + hard-zero-velocity, for any mode, exactly as before.
+- ACCEPTED/CLAMPED: `gateAction` is neither `REJECTED` case → both new conditions false → falls through to the unchanged `else` (rotate `localDisplacement` → `ekf.predict()` → `nhc.applyConstraint()` if enabled).
+- Pedestrian fallback rejected-for-telemetry: `isPedestrianFallbackActive=true` → new branch's `!isPedestrianFallbackActive` is false → falls through to the same unchanged `else`, which still applies the pedestrian's own capped displacement with NHC still skipped via its existing check.
+
+### Build verification — the sandbox cannot run Gradle here, confirmed, not assumed
+
+Unlike every prior session's standing caveat, this environment turned out to actually have a JDK (`Java 17`, Eclipse Adoptium) and a real Android SDK at `D:\Android SDK` (per `local.properties`) — `./gradlew --version` runs and correctly reports Gradle 9.6.0 / Kotlin 2.3.21. So a real attempt was made: `./gradlew compileDebugKotlin` was run three ways (default daemon, `--no-daemon`, and `--no-daemon` with `GRADLE_OPTS` matched to `gradle.properties`'s own JVM args to avoid a re-fork). **All three failed identically**, before reaching the Kotlin compiler at all: `java.io.IOException: Unable to establish loopback connection` — Gradle's own inter-process JVM communication (needed even for a single-use forked process, not just the persistent daemon) requires a loopback TCP socket, which this sandboxed shell environment blocks outright. This is a genuine, confirmed environment/sandbox limitation, not a code problem and not a guess — three different invocation strategies were tried specifically to rule out "maybe just the daemon is the issue" before concluding this. **The change was verified by manual re-tracing (symbol-by-symbol: `ekf.state`, `imuBuffer.stride`, `imuBuffer.targetDtNs`, `transformer.rotateLocalToWorld`, `ModelMetadata.GRAVITY_MPS2` all already used identically elsewhere in this same file) and by the explicit trace-through above — not by an actual successful compile.** This should still be synced in Android Studio before trusting it for a demo.
+
+### Scope discipline
+
+`git diff --stat -- gudumap/app/src/main/java/com/example/gudumap/navigation/DeadReckoningEngine.kt`: **80 insertions, 2 deletions, 1 file** — exactly the new function and the three-way branch split described above, nothing else in the file touched. No other file changed in this part of the session (Step 1's Python/docs changes are §33's, listed there).
+
+### Still not build-tested / not verified
+
+Genuinely not compiled, for the environment reason documented above, not glossed over as "not build-tested this session" the way earlier entries could when a build tool simply wasn't installed — here the tools exist and the attempt was made and failed for a specific, identified reason (sandbox loopback-socket restriction on Gradle's own JVM forking). Needs, before any demo: an Android Studio sync (a full IDE environment may not hit the same sandboxed-shell restriction), a real compile, and an on-device vehicle-mode blackout test confirming position now advances (not freezes) during ML-rejected windows and that a genuine vehicle test's ACCEPTED/CLAMPED behavior is unchanged. The ML model, training code, and UI layout were not touched in this pass, per instruction. §33's still-open question — why NHC+ZUPT hurt plain physics at 60s/120s — remains uninvestigated; this session's fix uses plain Baseline 2 specifically to sidestep that question rather than answer it.
+
+## 35. 2026-09-18 — design-system foundation: navy/cyan/violet glassmorphic palette, dark-enforced theme, squircle shapes, and a reusable GlassCard; the real-blur library was researched and deliberately not adopted, with the reasons written down before code was written
+
+The team wants a deep navy/cyan/purple, iOS-style glassmorphic visual language ahead of an upcoming screening round. This pass builds only the design-system foundation -- `ui/theme/Color.kt`, `ui/theme/Theme.kt`, a new `ui/theme/Shapes.kt`, and a new reusable `ui/components/GlassCard.kt` -- and deliberately does not touch `NavigationScreen.kt` or `MapView.kt`'s layout, which is explicitly phase 2.
+
+### What was there before
+
+Read `Color.kt`, `Theme.kt`, and `Type.kt` in full before changing anything, per instruction. All three were confirmed to be the untouched stock Material3 template generated by Android Studio's project wizard: `Color.kt` had only the generic `Purple80`/`PurpleGrey80`/`Pink80`/`Purple40`/`PurpleGrey40`/`Pink40` placeholder swatches; `Theme.kt` had a `LightColorScheme` whose only non-default overrides were those same placeholder colors (its commented-out `background`/`surface`/`onX` block was never filled in); `Type.kt` had only `bodyLarge` set, everything else at Material3 defaults. Grepped the whole app for `Purple80`/`PurpleGrey80`/`Pink80`/`Purple40`/`PurpleGrey40`/`Pink40` before removing them -- the only hits were `Color.kt` and `Theme.kt` themselves, so nothing else in the app referenced the old placeholder palette.
+
+### The new palette -- every text/status pairing checked against WCAG contrast math, not eyeballed
+
+Per the brief's own emphasis that this is telemetry a driver or judge needs to read correctly, wrote a small script computing the real WCAG 2.x relative-luminance contrast ratio for every foreground/background pairing before picking final hex values (not after):
+
+```
+TextPrimary E8EAF6 on NavyBase 0A0E27        15.86:1
+TextPrimary E8EAF6 on NavySurface 12172E     14.76:1
+TextMuted 9CA3C9 on NavySurface               7.15:1
+CyanPrimary 22D3EE on NavySurface             9.78:1
+VioletSecondary A78BFA on NavySurface         6.50:1
+StatusGood 34D399 on NavySurface              9.20:1
+StatusWarning FBBF24 on NavySurface          10.59:1
+StatusError F87171 on NavySurface             6.39:1
+onPrimary 062024 on CyanPrimary 22D3EE        9.37:1
+onSecondary 1E1338 on VioletSecondary A78BFA  6.40:1
+```
+Every normal-text pairing above clears WCAG AA's 4.5:1 minimum, most by a wide margin. The one pairing that first came up short -- `onPrimaryContainer`/`primaryContainer` at 3.70:1 -- was caught by the same check and fixed by darkening the container (`0E7490` -> `0C5C73`) and lightening its on-color (`67E8F9` -> `A5F3FC`) until it cleared 6.02:1, rather than being shipped under-contrast. `Outline` (`5B6699`) was picked to clear the looser 3:1 non-text/UI-component minimum (3.2:1 on surface, 3.44:1 on base) since it's a border color, not text. `Color.kt` now defines: `NavyBase`/`NavySurface`/`NavySurfaceVariant`/`NavyElevated` (backgrounds), `CyanPrimary`+container/on-colors, `VioletSecondary`+container/on-colors, `TertiaryPink`+container/on-colors (a third accent Material3's `ColorScheme` expects, kept in the same purple family per the brief), `TextPrimary`/`TextMuted`, `StatusGood`/`StatusWarning`/`StatusError`/`OnStatus` (custom semantic roles -- Material3's `ColorScheme` has no built-in success/warning slots), `ErrorRed`+container/on-colors (reuses `StatusError` so "error" reads as one consistent color, not two different reds), and `Outline`/`GlassEdgeHighlight`.
+
+### Theme.kt -- dark enforced, and why dynamic color also had to go
+
+Grepped the whole app for `isSystemInDarkTheme` and for any call site passing `GudumapTheme(darkTheme = ...)` before hard-coding dark as the only theme, per instruction: the only hits for either were `Theme.kt`'s own old default parameter, and `MainActivity.kt`'s sole call site (`GudumapTheme { NavigationScreen() } `, confirmed by direct read) never overrode it. `Color.kt`'s old `LightColorScheme` was itself never customized past the stock template. **No real light-mode experience existed to preserve**, so `GudumapTheme`'s signature was simplified to take no `darkTheme`/`dynamicColor` parameters at all, always applying one `GudumapDarkColorScheme`.
+
+Dynamic (Material You / wallpaper-derived) color was also removed, not just left at its old default -- this wasn't explicitly asked for, but reasoned through as a necessary consequence: on API 31+, `dynamicDarkColorScheme(context)` replaces every app-defined color with whatever the device wallpaper happens to generate, which would silently undo this entire palette on any Android 12+ device. Kept as one clean `darkColorScheme(...)` call mapping every new token to its Material3 role (`primary`/`onPrimary`/`primaryContainer`/`onPrimaryContainer`, same pattern for `secondary`/`tertiary`, `background`/`onBackground`, `surface`/`onSurface`/`surfaceVariant`/`onSurfaceVariant`, `outline`, `error`/`onError`/`errorContainer`/`onErrorContainer`).
+
+### Shapes -- new `Shapes.kt`, 20-28dp squircle rounding
+
+New file, not folded into `Theme.kt`, matching the existing one-responsibility-per-file convention (`Color.kt`/`Theme.kt`/`Type.kt` already split that way). `GudumapShapes` sets `extraSmall`=20dp through `extraLarge`=28dp (Material3's stock defaults run roughly 4-16dp), wired into `MaterialTheme(shapes = GudumapShapes, ...)` in `Theme.kt`.
+
+### GlassCard -- semi-transparent-scrim approximation, explicitly labeled as such
+
+New `ui/components/GlassCard.kt`, alongside the existing `StatusCard.kt`/`MetricCard.kt` in the same directory. Implementation: `Modifier.shadow(16dp, shape, ambientColor/spotColor = black at 0.35 alpha)` for a soft ambient glow, `.clip(shape)`, a vertical gradient background (`NavyElevated` at 0.72 -> 0.58 alpha, for a top-lit glass sheen rather than a flat tint), and a 1dp `GlassEdgeHighlight` border. `shape`/`modifier`/`content` are the only parameters, so a real-blur swap later would not require touching call sites.
+
+**The doc comment on `GlassCard` itself states plainly, not just in this log, that this is an approximation, not real backdrop blur** -- Compose has no first-party blur-behind-content primitive, and whatever is actually behind this card is only tinted by the gradient above, never blurred.
+
+### Haze -- evaluated with real research, not from memory, and deliberately not adopted
+
+The brief asked to evaluate `dev.chrisbanes.haze` for genuine backdrop blur, check its minSdk/compileSdk compatibility against this project (`compileSdk = 37`, `minSdk = 24`, confirmed by reading `build.gradle.kts`), and confirm it actually renders performantly on a live device before committing to it. Used `WebSearch`/`WebFetch` to check the library's real current state rather than relying on possibly-stale training knowledge:
+
+- Its `gradle.properties` on `main` currently declares version `2.0.1-SNAPSHOT`; Maven Central's own metadata lists `2.0.0-rc01` as the latest published release, with `1.7.3` as the last fully-stable release before the 2.0 line began -- i.e., the library is mid-major-version-transition right now, not settled.
+- Its own build file contains an AAR-metadata verification task asserting `"Expected Android AAR minCompileSdk=37"` on the current `main` branch, and its GitHub history shows a very recent PR titled "Lower Android compile SDK requirement" that walked a prior release's requirement back down from SDK **37.2** (a point release beyond a normal Android Studio install) to plain 37.0 after apparently causing consumer friction. This project's own `compileSdk` is exactly 37 -- technically compatible with the current `main`, but with zero margin against a requirement that has moved at least twice recently.
+- Most decisively: **this environment cannot build or run the app on a device at all.** A single `./gradlew.bat compileDebugKotlin --offline` attempt this session failed identically to every prior attempt in this project (`java.io.IOException: Unable to establish loopback connection`) -- the same sandbox restriction already established in this project's history, not something that changed. The brief's own bar for adopting Haze -- "actually renders performantly on a live device" -- is therefore categorically unverifiable here, independent of whatever Haze's own merits are.
+
+**Decision: Haze was not added.** No dependency was added to `build.gradle.kts`, confirmed via `git diff` showing its only change is the same pre-existing unrelated 2-line indentation diff flagged in every prior session's entry. The scrim-approximation `GlassCard` above was implemented instead, exactly per the brief's own fallback instruction, and is labeled as an approximation both in its own doc comment and here.
+
+### Compile verification -- honest about what this actually confirms
+
+Ran `./gradlew.bat compileDebugKotlin --offline -q` once. It failed with the identical `Unable to establish loopback connection` error this project has hit on every previous Gradle attempt -- confirming (again) that this sandbox cannot run Gradle at all, not that this session's code has no errors. Did **not** retry further, consistent with this project's own prior conclusion that repeating the same failing invocation produces no new information. In place of a real compile, manually cross-checked every symbol used in the four touched/new files against where it's actually defined: every `Color(...)` reference in the new `Theme.kt`/`GlassCard.kt` resolves to a name genuinely declared in the new `Color.kt`; `GudumapShapes` and `Typography` (referenced bare in `Theme.kt`, no import) are both in the same `com.example.gudumap.ui.theme` package as `Theme.kt` itself; `GlassCard.kt`'s cross-package imports (`com.example.gudumap.ui.theme.GlassEdgeHighlight`, `...NavyElevated`) are both present and match real declared names; and `MainActivity.kt`'s sole `GudumapTheme { ... }` call site (re-read directly) passes no arguments, matching the simplified no-parameter signature exactly. This is a manual, not a compiler-verified, guarantee.
+
+### Scope discipline
+
+`git diff --stat -- gudumap/` for this session:
+
+```
+gudumap/app/src/main/java/com/example/gudumap/ui/theme/Color.kt   |  66 ++++++++++++++--
+gudumap/app/src/main/java/com/example/gudumap/ui/theme/Theme.kt   |  87 ++++++++++++----------
+```
+Plus two new, untracked files: `ui/theme/Shapes.kt` and `ui/components/GlassCard.kt`. `git diff --stat` on `NavigationScreen.kt` and `MapView.kt` both return **completely empty** -- confirmed untouched, as this phase required. Two other items appear in this session's full `git diff --stat -- gudumap/` but are **not** part of this session's work: `DeadReckoningEngine.kt`'s diff is entirely §34's already-logged physics-primary-fallback change from a prior session, not reopened or touched here; `build.gradle.kts`'s 2-line diff is the same pre-existing, unrelated leftover flagged in every session since it first appeared.
+
+### Still not build-tested
+
+Same standing limitation as every session touching Kotlin in this project, now doubly confirmed: this sandbox cannot run Gradle (`Unable to establish loopback connection`, three-plus attempts across two sessions) and has no connected Android device. Before trusting this for the screening: an Android Studio sync and a real build, then an on-device visual check that the new palette actually reads as intended (the WCAG math above is necessary but not sufficient -- real OLED/LCD panel gamma, ambient screening-room lighting, and glare could still make something look worse in person than the numbers suggest), and a check that `GlassCard`'s shadow/gradient approximation doesn't look flat or muddy against whatever phase 2 ends up placing on top of it. Phase 2 (wiring this system into `NavigationScreen.kt`/`MapView.kt`'s actual layout) has not been started.
+
+## 36. 2026-09-18 (continued) — phase 2: NavigationScreen.kt rebuilt as a full-bleed map with floating GlassCard overlays (status pill, details drawer, blackout FAB) instead of a scrolling Column; every navState field reference re-verified against the current file, not a stale list
+
+Phase 1 (§35) built the design-system foundation (palette, dark theme, squircle shapes, `GlassCard`) without touching any screen layout. This session wires it into `NavigationScreen.kt`: MapView becomes the full-bleed background of the whole screen, and every card that used to live in a scrolling `Column` above/below it is now a floating `GlassCard` overlay on top -- the same map-as-canvas, controls-floating-on-top pattern most modern navigation apps use. `MapView.kt` and `NavigationState.kt` were read in full but not modified; `DeadReckoningEngine.kt` and everything else under `navigation/` was not opened at all this session.
+
+### Read first, per instruction
+
+Read `NavigationScreen.kt`, `MapView.kt`, and `NavigationState.kt` in full before writing anything. Extracted every `navState.X` reference from the pre-session file via `grep -oE "navState\.[a-zA-Z.]+" | sort -u`: 34 distinct references (32 direct `NavigationState` fields plus `blackoutMetrics.drDistance`/`blackoutMetrics.maximumPositionErrorMeters`, plus `currentRoadName.isNotBlank` counted as its own match by the regex). Cross-checked every one against the current `NavigationState.kt` (47 lines, 32 real fields) and `BlackoutMetrics.kt` (confirmed `drDistance`/`maximumPositionErrorMeters` both present) -- **all 34 resolved**, none stale, none invented for this rewrite. Re-ran the identical extraction against the finished new file afterward: **still exactly the same 34 references, byte-for-byte** -- the rewrite changed containers and styling, not one field name.
+
+### The restructure
+
+`MapView` is now called once, always with `isExpanded = true` (its own existing `fillMaxSize()`/no-border/no-corner-radius branch, already used for the old true-fullscreen mode -- reused, not duplicated) and `onToggleExpand = null` (its own existing floating expand button simply isn't rendered, since a `Box(fillMaxSize)` background has nothing left to expand into -- an already-supported, optional parameter, not a change to `MapView.kt`'s logic). The old `isMapExpanded` state and its early-return "true fullscreen, hide everything else" branch are gone entirely, since the map is unconditionally full-bleed now -- there's no longer a second map-sizing state to toggle between.
+
+Every other pre-phase-2 element becomes a floating overlay inside the same `Box`:
+- **`TopStatusPill`** -- a compact `GlassCard`: the old `StatusBanner`'s tri-state plain-language message/color logic (blackout / GNSS_RECOVERY / live-tracking), unchanged, as the leading label, plus compact EKF/ML dot-chips and the Motion Mode badge. Motion Mode is still gated on `navState.blackoutMode` exactly as before -- §30/§24's own reasoning (showing it outside blackout would be misleading, since it just sits at its neutral default) is preserved verbatim, not just the visual style.
+- **`PermissionBanner`** -- floats independently below the status pill when `!permissionGranted`, same trigger and same `permissionLauncher.launch(...)` call as before.
+- **`BlackoutFab`** -- bottom-start floating action button. See "Preserved exactly" below.
+- **`DetailsDrawer`** -- bottom-center floating `GlassCard`, collapsed by default (a slim clickable header row: "Details" + a "▼ Show"/"▲ Hide" toggle), expanding via the same `AnimatedVisibility`/`expandVertically`/`shrinkVertically` combinator the old "technical details" section already used. Expanded content is capped at `heightIn(max = 420.dp)` with its own `verticalScroll`, so it can never grow to cover the full screen. Contains, in order: position confidence (still gated on `navState.blackoutMode`, moved here from its old always-visible-outside-the-toggle position per this session's explicit brief), BLACKOUT METRICS, NAVIGATION STATUS (including the road-name line), POSITION, NAVIGATION METRICS, SENSOR STATUS -- the same six sections, same fields, same `String.format` patterns as the old "technical details" Column, just restyled onto `NavySurfaceVariant` tiles instead of white Material3 `Card`s.
+
+### Preserved exactly, per the non-negotiable constraints
+
+- **`BlackoutFab`**: every branch of the old `BlackoutControlButton` `when` block carried over with identical conditions and identical label strings -- `!navState.hasGpsFix` -> disabled "WAITING FOR GPS FIX..." (Fix 2, §11), `navState.blackoutMode` -> "GNSS BLACKOUT ACTIVE (TAP TO END)", `GNSS_RECOVERY` -> disabled "RECOVERING GNSS...", `blackoutControlStage == 1` -> "START GNSS BLACKOUT", else -> "GNSS AVAILABLE" (arms the two-stage flow). Only the container changed (a `Button` shaped as a squircle pill sized to its label instead of a full-width Material3 `Button`) and the colors (phase-1 tokens instead of raw hex, same semantic mapping: green=available, red=active/start, muted=disabled, amber=recovering). The `blackoutControlStage`/`onArm`/`onStart`/`onEnd` wiring in `NavigationScreen()` itself is untouched -- same two state transitions, same `navViewModel.setBlackoutMode(...)` calls.
+- **Motion Mode visibility**: still `if (navState.blackoutMode) { MotionModeBadge(...) }`, now inside `TopStatusPill` instead of the old Column -- same condition, same two states (VEHICLE_MODE blue/car, CONSERVATIVE_MODE amber/walking), same icons.
+- **`MapView.kt`**: zero lines changed (confirmed via `git diff --stat`, empty output) -- its offline-only tile source, `OfflineMapManager.MIN_ZOOM`/`MAX_ZOOM` ceiling, and dual naive-vs-corrected trail rendering during blackout are exactly as they were. Only the caller's own parameters (`isExpanded`, `onToggleExpand`) changed, which is `NavigationScreen.kt`'s call-site decision, not `MapView.kt`'s logic.
+
+### Compile verification -- honest about what this actually confirms
+
+Ran `./gradlew.bat compileDebugKotlin --offline -q` once. Failed identically to every previous attempt in this project: `java.io.IOException: Unable to establish loopback connection`. Not retried further, consistent with this project's own established conclusion that this sandbox cannot run Gradle at all. In place of a real compile: the field-by-field `navState.X` trace above (34/34 resolved, re-verified against the finished file, not just the plan), and a manual cross-check that every referenced design-system symbol actually exists -- `CyanPrimary`, `OnCyanPrimary`, `ErrorRed`, `OnErrorRed`, `StatusGood`, `StatusWarning`, `StatusError`, `OnStatus`, `TextPrimary`, `TextMuted`, `VioletSecondary`, `OnVioletSecondary`, `Outline`, `NavySurfaceVariant` were each grepped against `Color.kt` and found declared exactly once; `GudumapShapes.extraSmall/small/medium/large/extraLarge`, `GlassCard(modifier, shape, content)`, and `MapView`'s full parameter list were each re-read from their source files and matched against every call site in the new file. This is a manual, not a compiler-verified, guarantee.
+
+### Scope discipline
+
+```
+gudumap/app/src/main/java/com/example/gudumap/ui/screens/NavigationScreen.kt | 1119 ++++++++++---------- (550 insertions, 569 deletions)
+```
+`git diff --stat` on `MapView.kt` and `NavigationState.kt` -- read in full this session for field verification -- both return **completely empty**: neither was modified. `DeadReckoningEngine.kt`'s diff is entirely §34's already-logged change from a prior session, not reopened this session (not even read). `build.gradle.kts`'s 2-line diff and `Color.kt`/`Theme.kt`'s diffs are §35's, unchanged this session. No file under `navigation/` besides reading `NavigationState.kt` was opened.
+
+### Still not build-tested / not verified
+
+Same sandbox limitation as §35 -- genuinely not compiled, for the identified reason (Gradle's own loopback-socket restriction in this environment), not glossed over. Needs, before the screening: an Android Studio sync and a real build; an on-device check that the floating overlay positions don't visually collide with `MapView`'s own corner controls -- specifically, the `BlackoutFab` (bottom-start, offset 76dp up to clear `MapView`'s ~52dp-tall "MY LOCATION" pill) and the `DetailsDrawer` (bottom-center, inset from the edges so `MapView`'s bottom corner pills stay reachable around it) were positioned by estimating `MapView`'s own internal control heights from its source, not by rendering and measuring on a real screen; a check that the new `WindowInsets.safeDrawing` padding on each floating element actually clears the status bar/gesture nav area on a real device; and a walkthrough of both the blackout two-stage arm/confirm flow and the details-drawer expand/collapse animation to confirm they feel right at actual touch-target sizes. The ML model, training code, and every file under `navigation/` besides `NavigationState.kt` (read-only) were untouched, per instruction.
+
+## 37. 2026-09-18 (continued) — phase 3: restrained Compose animation pass (status-pill crossfade + live pulse, uncertainty-radius tween, precision-safe marker glide) on top of the already-confirmed phase 1/2 code; every animation is cosmetic-only by construction, none gates or delays what real data reaches the screen
+
+Before starting, confirmed phases 1 and 2 are actually present in the current tree by reading the files rather than assuming: `Color.kt`/`Theme.kt`/`Shapes.kt`/`GlassCard.kt` (§35) and the current `NavigationScreen.kt` (§36, `TopStatusPill`/`BlackoutFab`/`DetailsDrawer` all present, full-bleed `MapView` background confirmed) all match what those entries describe. This phase adds motion to two files -- `NavigationScreen.kt` (the status pill) and `MapView.kt` (the uncertainty circle and vehicle marker, both native osmdroid overlays driven from Compose state, not Compose UI themselves) -- using only `androidx.compose.animation`/`androidx.compose.animation.core` APIs already available via the existing Compose BOM (`2026.02.01`, confirmed in `gradle/libs.versions.toml`); no new dependency was added.
+
+### 1. Crossfade on the status pill's normal/blackout/recovering states
+
+`TopStatusPill`'s dot-color-plus-message pair (previously computed once via a plain `when` and rendered instantly) is now driven by a `PillVisualState` enum (`LIVE`/`BLACKOUT`/`RECOVERING`, same three conditions as before, unchanged) fed into `Crossfade(targetState = visualState, animationSpec = tween(300), ...)`. The EKF/ML compact chips and the Motion Mode badge sit outside the `Crossfade` -- they update instantly on every recomposition exactly as before, since the brief asked specifically for the pill's own state transition to animate, not every readout inside it. Motion Mode's `if (navState.blackoutMode)` visibility condition is untouched, byte-for-byte.
+
+### 2. animateFloatAsState on the position-uncertainty circle
+
+`MapView.kt` now computes `animatedUncertaintyRadius by animateFloatAsState(targetValue = uncertaintyRadiusMeters.toFloat(), animationSpec = tween(400), ...)` and feeds that into `Polygon.pointsAsCircle(currentPoint, animatedUncertaintyRadius.toDouble())` instead of the raw value. **The show/hide gate itself (`if (blackoutMode && uncertaintyRadiusMeters > 0.5)`) still reads the real, unsmoothed `uncertaintyRadiusMeters`** -- deliberately, so the circle's appearance/disappearance is never delayed by the animation catching up; only how quickly its *size* visually changes is smoothed.
+
+### 3. A subtle, constant "live" pulse -- not tied to data quality
+
+Chose the status pill's leading dot over the vehicle marker for this (the brief offered either). Reasoning: the dot is a genuine Compose composable (`Box` + `Modifier.alpha`), so the pulse is trivial and unambiguous to reason about; the vehicle marker is a native osmdroid `Marker`, and while it does expose an `alpha` property, pulsing it would risk interacting with its tap/info-window handling and the legibility of its heading arrow at low-alpha moments in ways that are hard to verify without a device. Implemented as `rememberInfiniteTransition` -> `animateFloat(0.55f -> 1f, infiniteRepeatable(tween(1100, LinearEasing), RepeatMode.Reverse))` applied via `Modifier.alpha(pulseAlpha)` on the 8dp dot. The cycle is identical regardless of `visualState` or any real data-quality signal -- it means "the app is running," nothing more, so it can't misrepresent anything about the actual fix/estimate.
+
+### 4. Precision-safe vehicle-marker glide between position updates
+
+This was the trickiest of the four, and worth recording why: osmdroid's `Marker` is not a Compose UI element, and Compose's `Animatable`/`animateFloatAsState` vector representation (`AnimationVector1D` etc.) is internally `Float`-based regardless of the type it appears to wrap -- meaning a naive `animateFloatAsState(targetValue = longitude.toFloat())` would leave the marker's *resting* position permanently degraded to Float precision (~7 significant digits, enough to matter at the meter scale this app's own drift/error metrics report in), not just its in-between frames. Avoided that by animating a plain `Animatable<Float>` **progress** value (0f -> 1f, a quantity that never needs more than Float precision) and doing the actual lat/lon blend (`from + (to - from) * progress`) myself in `Double`, in `MapView.kt`. A `LaunchedEffect(latitude, longitude)` captures the currently-displayed (possibly mid-glide) point as the new `from` whenever a real update arrives, sets `to` to the new real point, and runs `progress.animateTo(1f, tween(300, LinearEasing))` -- a short, linear (not spring/bouncy) tween, comfortably under this app's ~1.0s ML-window/GNSS update cadence, so the glide always finishes before the next real update rather than visibly lagging behind it. Only `marker.position` uses the interpolated point; every other reader of `latitude`/`longitude` in the same function (both trail polylines, the uncertainty circle's center, the pinpoint ring, map recentering) reads the raw real `Double` values directly, unsmoothed -- confirmed by re-reading the full `update` lambda after editing it, not just the lines that changed.
+
+### What was deliberately not touched
+
+Per instruction, `BlackoutFab` (the arm-then-confirm two-stage flow) was not touched at all this session -- no animation was added to it, so its accidental-tap-resistance is exactly as it was in §36. `DetailsDrawer`'s existing `AnimatedVisibility` expand/collapse (already present from §36) was left as-is; this phase's brief didn't ask for changes there. Nothing under `navigation/` was opened.
+
+### Compile verification -- honest about what this actually confirms
+
+Ran `./gradlew.bat compileDebugKotlin --offline -q` once. Failed identically to every previous attempt: `java.io.IOException: Unable to establish loopback connection`. Not retried further. In place of a real compile: re-ran the same `navState.X` field extraction used in §36 against the post-animation file -- **still exactly 34 references, unchanged**, confirming this pass touched rendering/animation only, no field wiring. Balanced brace/paren counts were checked on both edited files (`NavigationScreen.kt`: 86/86 braces, 367/367 parens; `MapView.kt`: 83/83 braces, 240/240 parens). Checked `gradle/libs.versions.toml` and confirmed the project's Compose BOM (`2026.02.01`) is well past the versions that introduced every API used here (`Crossfade`'s `label`/`modifier` params, `InfiniteTransition.animateFloat`, `animateFloatAsState`, `Animatable`), so none of this is version-gated. This is a manual, not a compiler-verified, guarantee.
+
+### Scope discipline
+
+```
+gudumap/app/src/main/java/com/example/gudumap/ui/components/MapView.kt      |  49 +-
+gudumap/app/src/main/java/com/example/gudumap/ui/screens/NavigationScreen.kt (TopStatusPill only, +~45/-~15 lines within this session)
+```
+Confirmed via a direct re-read that only `TopStatusPill` changed in `NavigationScreen.kt` this session -- `BlackoutFab`, `DetailsDrawer`, `MotionModeBadge`, `PermissionBanner`, `CompactStatusChip`, and every helper below them are untouched from §36. `Color.kt`/`Theme.kt`/`DeadReckoningEngine.kt`/`build.gradle.kts` diffs are all prior sessions' (§34/§35), not reopened here.
+
+### Still not build-tested / not verified
+
+Same standing sandbox limitation (Gradle's loopback-socket restriction) as every Kotlin-touching session in this project. Needs, before the screening: an Android Studio sync and a real build; an on-device check that the pulse is actually subtle rather than distracting at real screen brightness/size (0.55-1.0 alpha over 1.1s was picked by reasoning, not measured against a real display); a check that the 300ms marker-glide tween doesn't look like it's "chasing" position during rapid consecutive updates (e.g., a fast vehicle at a short update interval) -- the 300ms figure assumes the ~1.0s cadence documented elsewhere in this project holds in practice; and a check that the uncertainty-circle's 400ms grow/shrink doesn't look laggy relative to the marker's own 300ms glide when both change together. None of these timing choices have been tuned against real recorded sensor/GNSS update-rate data.
+
+## 38. 2026-09-18 (continued) — phase 4: rebrand to "Naviator" (display name, launcher icon isolated from the real source logo via a real image-processing pipeline, in-app splash screen); Gradle's loopback restriction was re-attempted twice this session (with and without `--offline`, since a brand-new dependency needed real resolution) and still blocks a real build -- said plainly, not treated as equivalent to the manual review
+
+Confirmed phases 1-3 before starting, by reading rather than assuming: `docs/PROJECT_STATUS.md`'s §35/§36/§37 and `git log`/`git status` (still just the original 3 commits, same uncommitted files those entries describe) both check out. Read the actual source logo at `docs/branding/naviator_logo_source.png` (2816x1536 RGBA, confirmed via `Read`, not just its filename) before generating anything from it -- it matches the brief exactly: dark navy background, a glowing cyan-to-purple location-pin mark with a circuit/wifi motif, "Naviator" wordmark baked in below it, plus a small unrelated sparkle decoration bottom-right. Package ID (`com.example.gudumap`) was not touched anywhere; `DeadReckoningEngine.kt` and everything else under `navigation/` were not opened this session (its diff in `git status` is entirely §34's, from a prior session).
+
+### Task 1 -- display name
+
+Found a real discrepancy before changing anything: the brief assumed `AndroidManifest.xml`'s `android:label` reads `@string/app_name`, but it actually hardcoded the literal string `"Gudumap"` directly -- `strings.xml`'s `app_name` was dead, unreferenced from anywhere in `app/src` (confirmed by `grep -rn "app_name" app/src/`). Fixed this properly instead of patching two disconnected places to the same new value: changed `strings.xml`'s `app_name` to `"Naviator"` **and** changed the manifest to `android:label="@string/app_name"`, so there is now one real source of truth where the brief assumed one already existed. `settings.gradle.kts`'s `rootProject.name` changed `"gudumap"` -> `"Naviator"`. Checked `gradle.properties` in full -- it has no human-readable project-name string of any kind (only JVM args, configuration-cache, and Kotlin code-style settings), so there was nothing to change there; not skipped, checked and confirmed empty. `android:theme="@style/Theme.Gudumap"` was deliberately left as-is -- an internal resource identifier, not a user-visible string, the same category of thing as the package ID this phase was told to leave alone.
+
+### Task 2 -- launcher icon
+
+**A second real discrepancy, more consequential than the first:** the manifest's `<application>` tag had no `android:icon` (or `android:roundIcon`) attribute at all -- the existing `mipmap-*/ic_launcher.webp` files (confirmed to be the untouched stock Android-Studio-template icon: green `#3DDC84` background, grid overlay, generic robot-adjacent foreground shape) were never actually wired to display. Generating new icon files alone would have been silently inert without also adding `android:icon="@mipmap/ic_launcher"` / `android:roundIcon="@mipmap/ic_launcher_round"` to the manifest, which this entry does.
+
+**Tooling check, per instruction:** `which magick convert` found only Windows' own filesystem-conversion `convert.exe` (not ImageMagick); confirmed Python + Pillow 12.3.0 is available via this project's existing `dead_reckoning/.venv313`, and used that for everything below -- no hand-eyeballed crops.
+
+**Isolating the pin from the wordmark/glow/sparkle, without picking crop coordinates by eye:** wrote a script that subtracts a heavily Gaussian-blurred (radius 30) copy of the source from itself -- the soft ambient glow and flat navy background survive that blur closely (near-zero difference), while the crisp neon pin/circuit linework does not, so the difference magnitude isolates exactly the linework. A row-wise energy profile of that difference (`row_energy = diff_mag.sum(axis=1)`, printed and read directly, not assumed) showed a clean three-cluster structure top-to-bottom: the pin (rows ~220-1120), a genuine gap (~1120-1160, energy back at background baseline), then the wordmark (~1140-1320) -- confirming the pin can be isolated by row range alone, and that the same row range excludes the bottom-right sparkle (which sits at the wordmark's vertical level, not the pin's). Precise pixel bbox within that row band: **x[949,1865] y[234,1071]**, stable across several cutoff choices tested (1100/1110/1120/1130 all agreed).
+
+**A real bug caught mid-process by inspecting the actual output, not by trusting the method:** the first alpha-extraction pass (threshold 15, linear gain) produced visible speckle noise scattered across the whole isolated layer -- checked the histogram of the difference magnitude directly rather than guessing a fix, found it genuinely bimodal (background/grain noise under ~30, real neon strokes at ~50-160, a real valley between them), and re-cut the threshold to a hard floor of 40 with the real signal range (40-150) remapped to a smooth 0-255 alpha ramp. Re-generated and visually confirmed (via `Read` on the resulting PNG) that the speckle is fully gone and the pin renders cleanly on both a transparent background and composited onto the real navy gradient.
+
+**Layout:** the isolated pin (976x897) was centered in a 1502x1502 transparent square sized so it occupies ~65% of the square's larger dimension -- inside the adaptive icon's 72/108 (66.7%) inner safe zone with a small margin, not right at the edge of it.
+
+**Generated, all via the same script (not hand-touched afterward):**
+- `res/drawable/ic_launcher_foreground.png` (432x432, transparent, pin only) -- a single high-resolution raster in the density-independent `drawable/` bucket, replacing the old vector `ic_launcher_foreground.xml` (deleted outright to avoid a duplicate-resource conflict with the new PNG under the same resource name, not left behind as dead weight). One raster asset rather than per-density variants mirrors how the vector it replaces was already resolution-independent; Android downscales it for lower-density devices same as it would a vector.
+- `res/drawable/ic_launcher_background.xml` -- rewritten as a flat vector (kept as vector, not raster, since it's just a fill) using a subtle top-to-bottom gradient between the two real values in Phase 1's `Color.kt`: `NavyBase #0A0E27` -> `NavySurface #12172E` -- checked that file directly for both hex values rather than guessing either.
+- `res/mipmap-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_launcher.webp` and the `_round` variant at each -- pin composited onto the same navy gradient, at 48/72/96/144/192px respectively (the same five sizes the existing files already used, confirmed via Pillow before overwriting, not assumed). Round variants are identical artwork to the square ones at each density, matching how this project's original template icons were also generated (masking is the launcher's job, not baked into the source).
+- `mipmap-anydpi-v26/ic_launcher.xml` / `ic_launcher_round.xml` needed **no changes** -- they already reference `@drawable/ic_launcher_background` / `@drawable/ic_launcher_foreground` by resource name, which now resolve to the new gradient vector and new PNG automatically.
+
+### Task 3 -- splash screen
+
+Read `MainActivity.kt` in full first: a single direct `setContent { GudumapTheme { NavigationScreen() } }`, no navigation library, no existing splash of any kind.
+
+**The constraint that shaped the whole design:** the splash must never delay real sensor/location/permission initialization. `NavigationViewModel`'s `init {}` block calls `navigationEngine.start()` directly -- meaning creating that ViewModel instance IS the trigger for real hardware/permission work to begin. The chosen design therefore composes `NavigationScreen(navViewModel = navViewModel)` **unconditionally, from the very first frame**, with `navViewModel` hoisted above the splash/main switch (not created lazily inside a lazily-composed branch) -- and the new `SplashScreen` composable is layered on top of it inside a `Box`, as a purely visual `AnimatedVisibility` overlay that self-dismisses via a callback. `NavigationScreen`'s own permission-check-and-request flow (declared inside itself, unchanged) starts running immediately too, since it's part of the same unconditionally-composed tree. No navigation library was added -- the switch is a single `remember { mutableStateOf(true) }` boolean, per instruction.
+
+**`SplashScreen.kt` (new):** shows the isolated `ic_launcher_foreground.png` mark (the same asset the launcher icon uses, for one consistent brand image, rather than re-embedding the busy original source image with its own glow/wordmark/background baked in) plus a recreated "Naviator" wordmark using `MaterialTheme.typography.headlineMedium` (Phase 1's `Type.kt` customizes only `bodyLarge`; everything else, including this, is the Material3 default inherited through `GudumapTheme`) with a `Brush.linearGradient(CyanPrimary, VioletSecondary)` text brush, echoing the mark's own gradient. Entrance: fade 0->1 and scale 0.88->1.0 together, `tween(550ms, FastOutSlowInEasing)` -- consistent with phase 3's "short tween, not spring/bouncy" language. Total on-screen hold before the parent's own 350ms exit-fade begins: 1300ms, comfortably inside the requested 1.2-1.8s window.
+
+**System-level piece (AndroidX SplashScreen API):** checked first, per instruction -- `androidx.core:core-splashscreen` was not already a dependency (confirmed via grep across `build.gradle.kts`/`libs.versions.toml`). Looked up the actual current stable version via `WebSearch` rather than guessing (`1.2.0`, released 2025-11-05, confirmed independently via Maven Central's own metadata and libraries.io) and added it directly in `build.gradle.kts`, matching this project's existing precedent of adding some dependencies as plain version strings outside the `libs.versions.toml` catalog (e.g. `play-services-location`). New `Theme.App.Starting` style in `themes.xml`, parented on `Theme.SplashScreen`, setting only `windowSplashScreenBackground` (`#FF0A0E27`, `NavyBase`) -- no icon/animation configured, exactly per instruction ("background color only, no logo needed there"). Wired via `android:theme="@style/Theme.App.Starting"` on `<activity android:name=".MainActivity">` specifically (the application-level theme stays `Theme.Gudumap`, the app's real theme, unchanged). `MainActivity.onCreate()` calls `installSplashScreen()` before `super.onCreate()`, per the API's own requirement.
+
+**Two real mistakes caught by checking documentation instead of trusting memory, since there's no compiler here to catch them:** (1) first wrote `import androidx.core.splashscreen.installSplashScreen` as a plain top-level import; cross-checked against the actual API reference and a second independent source and found the real import is `androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen` (it's a companion-object extension function, not top-level) -- fixed before this was ever going to be tested. (2) The first `Theme.App.Starting` draft had no `postSplashScreenTheme` item; a targeted search turned up that this attribute is required/expected specifically so the compat library knows which real theme to restore the Activity to once the splash finishes (especially relevant for a Compose-only app like this one, where there's no second meaningful XML theme otherwise) -- added `postSplashScreenTheme` pointing at `@style/Theme.Gudumap`. Neither mistake would have been caught without deliberately looking them up; both are exactly the kind of error a real compile would have caught instantly, which this session's environment still cannot provide.
+
+### Compile verification -- attempted twice this session, both failed the same way, stated plainly
+
+Per this phase's own explicit instruction not to treat manual review as equivalent to a build: ran `./gradlew.bat compileDebugKotlin --offline -q`, then (since a brand-new dependency needed real network resolution, a genuinely new variable this session, not just a repeat of prior phases' attempts) `./gradlew.bat compileDebugKotlin -q` without `--offline`. **Both failed identically**, before reaching dependency resolution or the Kotlin compiler at all: `java.io.IOException: Unable to establish loopback connection`. **This project's Kotlin/Android code has now gone four phases (design system, screen restructure, animation, rebrand) without a single successful build in this environment.** In place of a build: balanced brace/paren counts on both new/changed Kotlin files (`MainActivity.kt`: 9/9 braces, 18/18 parens; `SplashScreen.kt`: 6/6 braces, 31/31 parens); confirmed `NavigationScreen(navViewModel = navViewModel)`'s call matches that function's actual existing default-parameter signature (unchanged, re-read); confirmed every new resource reference (`R.drawable.ic_launcher_foreground`, `@style/Theme.Gudumap`, `@mipmap/ic_launcher`/`ic_launcher_round`) resolves to a file/style that genuinely exists at that exact name. This is a manual review, explicitly **not** a substitute for a real compile -- said outright rather than reused from a prior phase's framing.
+
+### Scope discipline
+
+```
+gudumap/app/build.gradle.kts                                          |  11 +-
+gudumap/app/src/main/AndroidManifest.xml                               |   7 +-
+gudumap/app/src/main/java/com/example/gudumap/MainActivity.kt          |  45 +-
+gudumap/app/src/main/res/drawable/ic_launcher_background.xml          | 180 +--
+gudumap/app/src/main/res/drawable/ic_launcher_foreground.xml          |  30 -  (deleted)
+gudumap/app/src/main/res/mipmap-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_launcher{,_round}.webp | (10 files, binary)
+gudumap/app/src/main/res/values/strings.xml                            |   2 +-
+gudumap/app/src/main/res/values/themes.xml                             |   9 +
+gudumap/settings.gradle.kts                                            |   2 +-
+```
+Plus two new, untracked files: `ui/screens/SplashScreen.kt` and `res/drawable/ic_launcher_foreground.png`. `DeadReckoningEngine.kt`'s diff (80 insertions/2 deletions) is entirely §34's, from a prior session -- not reopened, not even read this session. `NavigationScreen.kt`, `MapView.kt`, `Color.kt`, `Theme.kt` diffs are §35/§36/§37's, unchanged here. `com.example.gudumap` (the applicationId in `build.gradle.kts`) was not touched -- confirmed by re-reading `defaultConfig` directly, still `applicationId = "com.example.gudumap"`.
+
+### Still not verified
+
+**Build:** genuinely not compiled, for the same identified sandbox reason as every prior phase, now confirmed a fourth time with two different flag combinations this session specifically. **On-screen rendering (cannot be checked without a device, regardless of build status):** how the new adaptive icon actually looks masked by a circular vs. squircle vs. rounded-square launcher shape on a real device; whether the legacy (`mipmap-*/ic_launcher.webp`) icons look correctly scaled/anti-aliased at their real physical sizes rather than just in this session's own PNG preview; the actual splash-to-main transition timing and whether the `AnimatedVisibility` exit-fade overlapping with `NavigationScreen`'s own first real frame (map tiles loading, GNSS status arriving) looks clean or shows a visible seam; and whether `postSplashScreenTheme`'s handoff back to `Theme.Gudumap` is seamless or shows a flash, particularly on API levels below 31 where the compat library manages this manually rather than the OS doing it natively. None of these can be confirmed by source review alone.
+
+## 39. 2026-09-18 (continued) — first real, external build signal on this whole design-system effort: Android Studio's actual Gradle caught a genuine bug §38's manual review missed (`--` inside an XML comment), fixed; still not independently re-verified in this session's own sandbox
+
+The user ran an actual Android Studio build (not this session's sandboxed Gradle) and it failed at `:app:mergeDebugResources`/`:app:parseDebugLocalResources` with `"The string "--" is not permitted within comments."` -- a real XML-spec rule (a `<!-- -->` comment's body may not contain a literal `--` anywhere inside it, not just at the delimiters) that §38's manual review did not check for, because §38 had no way to run a real resource-merge step and didn't think to check this specific rule.
+
+### Root cause, found and fixed
+
+§38 wrote XML comments freeform, using `--` as a prose dash throughout this whole project's Kotlin `//` comments (where it's harmless) and carried that same habit into the two new/rewritten XML files without noticing XML comments are stricter. Grepped every `<!-- -->` block across all 10 XML files under `app/src/main/` for a literal `--` inside the body (not just at the open/close delimiters): found exactly one real violation, in the new `res/drawable/ic_launcher_background.xml`'s header comment ("Flat/near-flat by design -- the pin foreground layer..."). Fixed by rewording (removed the `--`, no functional change to the comment's meaning). `themes.xml`'s comment -- also written with a `--` in §38 -- turned out to no longer be present in the file at all by the time this session started (re-read directly, confirmed empty of comments); whatever removed it, the file is clean now and needed no further change there.
+
+### Verification beyond just this one rule
+
+Since this is the first real signal that this project's manual-review process can miss something a real tool would catch, didn't stop at the one reported error. Wrote a script using Python's `re` module to extract every `<!--...-->` block's body across all 10 XML files and check each for an internal `--`: **zero remaining after the fix**. Separately, parsed all 10 files with Python's `xml.etree.ElementTree` (a real XML parser, checking well-formedness generally -- unclosed tags, malformed attributes, bad namespaces -- not just this one comment rule): **all 10 parse cleanly**. This is a more rigorous check than anything done in §35-§38, specifically because this session had real evidence that the prior approach (grep/read-and-eyeball) had a real gap.
+
+### Still not verified
+
+**Cannot re-run the user's actual Android Studio build from this session** -- this environment's own Gradle still fails at the same pre-existing loopback-socket restriction documented in every prior phase (not re-attempted again this session; re-confirming an already-established, unrelated environment limitation would add nothing). The fix removes the specific reported error and passes a real XML well-formedness check, but **whether the build now succeeds past this point, and whether anything else in the build log after this error was masked by it, is only known once the user re-syncs/rebuilds themselves** -- not asserted as fixed-and-confirmed here.
+
+## 40. 2026-09-18 (continued) — second real build signal, same session: past `:app:mergeDebugResources`, `:app:compileDebugKotlin` surfaced 20 genuine Kotlin errors in `NavigationScreen.kt` -- three distinct missing-import bugs from phases 2/3, all real, all now fixed; one more speculative API call in `SplashScreen.kt` removed rather than gambled on
+
+With §39's XML fix applied, the user's real Android Studio build progressed past resource merging to `:app:compileDebugKotlin`, which reported 20 errors, all in `NavigationScreen.kt`. This is real ground truth this project has never had before -- both bugs below have been silently present since phase 2/3 (§36/§37) and were never caught by any prior manual review in this session's own sandbox, precisely because that sandbox cannot run a compiler.
+
+### Bug 1 -- `Unresolved reference 'animateFloat'` (line 301) + two cascading "cannot infer type" errors (304, 305)
+
+`TopStatusPill`'s live-dot pulse (§37) calls `liveDotPulse.animateFloat(...)` where `liveDotPulse: InfiniteTransition`. Wrongly reasoned in §37 that this resolves as a genuine member of `InfiniteTransition`, by (incorrect) analogy with `RowScope.weight` (which really is declared as a scope-interface member, needing no import). `InfiniteTransition.animateFloat` is actually a top-level **extension** function in `androidx.compose.animation.core`, requiring its own explicit import -- missing entirely from `NavigationScreen.kt`'s import list. Added `import androidx.compose.animation.core.animateFloat`; the two "cannot infer type" errors on the same call's arguments were downstream of this same unresolved-overload failure and needed no separate fix.
+
+### Bug 2 -- `Unresolved reference 'LinearEasing'` (line 305)
+
+The same pulse animation's `tween(durationMillis = 1100, easing = LinearEasing)` call references `LinearEasing`, but `NavigationScreen.kt` never imported it (§37 imported `RepeatMode`/`infiniteRepeatable`/`rememberInfiniteTransition`/`tween` for this same feature, but not `LinearEasing` alongside them -- a plain oversight, not a reasoning error like Bug 1). Added `import androidx.compose.animation.core.LinearEasing`.
+
+### Bug 3 -- `Unresolved reference 'height'` at eleven listed call sites (416, 544, 548, 569, 585, 588, 609, 618, 621, 646, 649) plus more not shown in the truncated build-output panel
+
+Traced to phase 2's original full rewrite (§36): the import list included `androidx.compose.foundation.layout.heightIn` (used once, for the details-drawer's max-height cap) but never `androidx.compose.foundation.layout.height` itself, despite `Modifier.height(...)` being used throughout the file for `Spacer`s -- an oversight that went unnoticed through §36, §37, and §38 because none of those sessions had a working compiler either. Added `import androidx.compose.foundation.layout.height`.
+
+### A fourth thing fixed pre-emptively, not from a reported error: removed rather than risk it
+
+While researching Bug 1, re-examined `SplashScreen.kt`'s `MaterialTheme.typography.headlineMedium.copy(brush = Brush.linearGradient(...))` (the gradient-text wordmark, §38) after realizing it had been written from memory, not verified. A `WebSearch` turned up that `TextStyle`'s `brush` parameter has historically required an `@ExperimentalTextApi` opt-in, and this project's Compose BOM (`2026.02.01`) is recent enough that this API may since have stabilized -- but there was no way to confirm which is true for the exact version this BOM resolves to, and being wrong either way (missing opt-in, or opt-in against an annotation since deleted) is a real compile error. Rather than gamble on an unverifiable detail for a purely decorative gradient, removed the `brush` entirely and set the wordmark to a plain `color = CyanPrimary` instead -- functionally almost identical visually, structurally risk-free. Removed the now-unused `Brush`/`VioletSecondary` imports that went with it.
+
+### Verification, given two compiler-confirmed misses already this session
+
+Not willing to just fix the four reported items and call it done. Cross-checked, across all five Kotlin files this whole design-system effort has touched or added (`NavigationScreen.kt`, `MapView.kt`, `SplashScreen.kt`, `MainActivity.kt`, `GlassCard.kt`), every `.height(`/`.width(`/`.size(`/`.weight(`/`.alpha(`/`.scale(`/`.padding(`/`.fillMax*(`/`.windowInsetsPadding(` call site against that file's own import list -- **every one now has a matching import present**, `weight` correctly excepted (a genuine `RowScope`/`ColumnScope` member, confirmed, not requiring one). Balanced brace/paren counts on both edited files (`NavigationScreen.kt`: 86/86 braces, 367/367 parens; `SplashScreen.kt`: 6/6 braces, 29/29 parens).
+
+### Still not verified
+
+Same as §39: this session's own sandbox still cannot run Gradle (not re-attempted again -- no new information to gain from repeating an already-established failure). These four fixes address every error the user's real build actually reported plus one pre-emptively de-risked call; **whether the next real build attempt succeeds, or surfaces yet another error `:app:compileDebugKotlin` hadn't reached yet, is unknown until the user re-runs it.** Given this session has now found real bugs on two separate real-build attempts in a row, that should be treated as the expectation going forward for this project's Kotlin files, not a fluke -- every phase's "manually verified" language in §35-§38 should be read with that in mind.
+
+## 41. 2026-09-18 (continued) — insets/edge-to-edge audit: the premise of the task ("the overlays likely aren't inset-padded") does not hold -- read `MainActivity.kt`/`NavigationScreen.kt` directly and both requirements were already correctly implemented in §36; no code changed, the session's actual work is the verification and the three-device-case reasoning this ask required regardless of whether a fix was needed
+
+Read `MainActivity.kt` and `NavigationScreen.kt` in full, per instruction, before assuming anything. Both came back already correct:
+
+- `MainActivity.kt` line 35: `enableEdgeToEdge()` is called, unconditionally, on every `onCreate()` -- present since §35/§36, not something this session added.
+- `NavigationScreen.kt`: all four floating overlays already chain `.windowInsetsPadding(WindowInsets.safeDrawing)` before their own fixed padding -- `TopStatusPill` (top, line ~210), `PermissionBanner` (top, line ~223), `BlackoutFab` (bottom, line ~250), `DetailsDrawer` (bottom, line ~270). This was §36's own work; §36's own "Still not build-tested" section already flagged it as present-but-unverified-on-device, not absent.
+- `MapView.kt`: confirmed via `grep -n "WindowInsets\|windowInsetsPadding\|safeDrawing\|systemBars"` returning nothing -- it applies no insets handling of its own, so it stays genuinely full-bleed under the system bars, exactly as intended (the map should extend edge-to-edge; only the interactive controls floating on top of it need to dodge the bars).
+
+**The task's stated guess -- "my guess is they don't [apply insets padding]" -- is factually wrong**, per direct code reading rather than assumption. No code was changed in `MainActivity.kt` or `NavigationScreen.kt` this session, since there was nothing broken to fix.
+
+### Confirmed `WindowInsets.safeDrawing` is still the currently-recommended choice, not guessed
+
+The task asked to check current best-practice guidance rather than assume `safeDrawing` is still right. `WebSearch` against Android's own developer documentation confirms `safeDrawing` is explicitly described as the type that "includes padding for display cutouts, and combines systemBars with displayCutout handling" -- i.e., exactly the union `systemBars() + displayCutout()` the task's own alternative phrasing suggested, plus `ime()` (harmless here: no `TextField`/`BasicTextField` exists anywhere in `NavigationScreen.kt`, confirmed by scanning the file, so the IME inset contributes zero on this screen in practice). The docs list `WindowInsets.safeDrawing` as one of the primary recommended approaches alongside `Scaffold`'s `PaddingValues` and `WindowInsets.safeContent`. `safeContent` (which additionally folds in gesture-exclusion insets) was considered and not adopted -- the task's own phrasing offered `safeDrawing` vs. the `displayCutout+systemBars` combination as the choice, not `safeContent`, and introducing it would be an unrequested scope expansion for a screen whose floating elements already sit well clear of the screen edges with their own margins.
+
+### Reasoning walked through against the three device cases the task named, since that's real analysis work independent of whether code changed
+
+1. **Display cutout / notch at the top:** `safeDrawing`'s top inset is the union (max) of `systemBars()`'s status-bar height and `displayCutout()`'s cutout height for that edge. Whichever is larger drives the actual padding `TopStatusPill`/`PermissionBanner` receive -- on a cutout device, that's the cutout's real reported height (typically taller than a plain status bar), so the pill is pushed below it automatically, not by a guessed constant.
+2. **3-button navigation at the bottom:** `systemBars()`'s bottom inset reports the reserved 3-button bar height (commonly ~48dp) on devices in that mode; unioned into `safeDrawing`, `BlackoutFab`/`DetailsDrawer` are pushed up above it.
+3. **Gesture navigation (thin bottom inset):** on devices in gesture-nav mode, the OS reports a much smaller bottom `systemBars()` value (the thin gesture-handle reservation, commonly ~16-24dp) for the same physical device -- `safeDrawing` reflects that live, current value, not a value baked in at compile time. The same `.windowInsetsPadding(WindowInsets.safeDrawing)` call therefore produces correctly different padding on the same device depending on which navigation mode is active, with zero code branching needed -- this is the core property a hardcoded padding constant could never have, and the reason this approach is correct across all three cases in the same code path rather than needing per-case handling.
+
+### A related, real, but explicitly out-of-scope finding -- flagged, not fixed here
+
+`MapView.kt`'s own floating corner controls (top-left offline badge, top-right compass pill, bottom-left "MY LOCATION" pill, bottom-right zoom/recenter/expand stack) use fixed `dp` padding only -- confirmed via the same grep, zero insets handling. These carry the identical risk this session's audit was asked to check for, just in a file the task explicitly scoped out ("independent of the map-engine work queued separately"). Flagged via `spawn_task` (`task_e81b5ef6`) rather than fixed in this pass, since touching `MapView.kt` was outside this session's stated scope.
+
+### Compile verification
+
+Ran `./gradlew.bat compileDebugKotlin --offline -q`. Failed identically to every prior attempt in this project: `java.io.IOException: Unable to establish loopback connection`. Since no Kotlin file was actually edited this session (nothing needed fixing), this attempt carried no new risk either way -- it's a restatement of the same standing sandbox limitation, not a new gap introduced here.
+
+### Still not verified
+
+**Cannot be verified from source alone, regardless of build status:** whether the reasoning above actually holds pixel-for-pixel on a real cutout device, a real 3-button-nav device, and a real gesture-nav device -- that requires either physical devices or an emulator run with different device skins/system-bar configurations, neither available in this session. The `safeDrawing` behavior described here is standard, documented Android platform behavior, not something specific to this app's code, but "the platform behaves this way" is not the same claim as "this app's specific layout, spacing, and z-ordering look correct when it does" -- the latter still needs an on-device check before the screening.
+
+## 42. 2026-09-18 (continued) — map engine migration, osmdroid to MapLibre Native, for real offline vector-tile detail matching the Organic Maps reference (styled in this app's own navy/cyan/violet, not the reference's literal light colors, per this phase's own explicit design call); this is by far the largest and least-verified change in the project -- new third-party rendering engine, never compiled, and the real Coimbatore vector-tile data does not exist yet (confirmed, not guessed, that this sandbox cannot generate it)
+
+### Step 1 research, done before any code, mirroring how Phase 1 evaluated Haze
+
+**Version/compatibility:** confirmed `org.maplibre.gl:android-sdk:13.6.1` directly against Maven Central's own `maven-metadata.xml` (a search-result snippet claimed a wrong "11.11.0"). MapLibre's own Android changelog confirms minSdk was bumped to API 23 at v12.0.0; this project's `minSdk=24`/`compileSdk=37` (re-read from `build.gradle.kts` directly) clears that with room to spare.
+
+**Offline vector-tile approach -- PMTiles vs. MBTiles, decided from real maintainer statements, not assumption:** PMTiles' `pmtiles://file://<path>` local scheme is real and documented, but a MapLibre maintainer directly states in a live GitHub discussion that offline PMTiles support is "quite limited... a lot of users have built their own custom solutions." A separate discussion has a different maintainer confirming MBTiles supports both vector and raster tiles via `mbtiles://file://<path>`, with a real user report confirming that exact pattern working on both Android and iOS. **Decided: MBTiles, not PMTiles** -- more mature, maintainer-endorsed, and `OfflineMapManager.kt` already manages an MBTiles file's lifecycle end-to-end, reusable almost as-is.
+
+**Producing the actual Coimbatore vector-tile data -- a real, empirically-confirmed blocker:** Planetiler is the practical tool (single JAR, built-in OpenMapTiles-equivalent default profile). Confirmed this sandbox has live internet access (`curl` reached Geofabrik and Overpass) and Java 17, downloaded the actual `planetiler.jar` (both the latest release and v0.8.2), and **both refuse to run**: `"You are using Java 17 but Planetiler requires 21 or later."` Checked for a second JDK already on this machine (none found) before concluding this. **The real vector `coimbatore.mbtiles` file does not exist and cannot be generated in this sandbox** -- a real machine needs a JDK 21+, `planetiler.jar`, an `.osm.pbf` extract covering `OfflineMapManager.COIMBATORE_BOUNDS` (e.g. via BBBike.org's custom-bbox extract service, which outputs `.osm.pbf` directly), then `java -jar planetiler.jar --osm-path=coimbatore.osm.pbf --output=coimbatore.mbtiles`.
+
+**Attribution -- confirmed exact wording, not treated as cosmetic:** per OSMF's own Attribution Guidelines, "© OpenStreetMap contributors" is the accepted standard wording; must be legible, in a corner, visible without the user interacting with anything first.
+
+**Paused here and asked the user before Step 2**, given the tile-data blocker was a real, unplanned-for gap (not the PMTiles-immaturity scenario the task's own stop condition anticipated, but weighty enough to check in on rather than push through). User's decision: build the full code integration now, generate real data later on a machine with Java 21+.
+
+### Step 2 implementation
+
+**`OfflineMapManager.kt`** rewritten: kept the exact asset-copy/verify/re-copy-on-size-mismatch lifecycle unchanged (format-agnostic at the SQLite level -- the `tiles` table schema is identical for raster and vector MBTiles). Dropped the osmdroid-specific `createOfflineTileProvider()`; replaced with `getMbtilesSourceUri()` (returns the confirmed `mbtiles://file://<path>` URI) and a new `resolveStyleUri()` that reads a style template asset, substitutes the real runtime mbtiles path for a `{{MBTILES_URL}}` placeholder, writes the resolved JSON to internal storage, and returns a `file://` URI to it -- done this way specifically because this session could not verify `Style.Builder().fromJson(String)`'s exact availability against real MapLibre KDoc (no compiler here to catch a mistake), whereas `fromUri("file://...")` uses the exact same URI scheme already confirmed for the tile source itself. `COIMBATORE_CENTER`/`COIMBATORE_BOUNDS` migrated off osmdroid's `GeoPoint`/`BoundingBox` -- `COIMBATORE_CENTER` (actually used, in `MapView.kt`) became a MapLibre `LatLng`; `COIMBATORE_BOUNDS` (confirmed via grep to be unused anywhere, in both the old and new code) became a plain library-independent `GeoBounds` data class rather than adding unverified MapLibre `LatLngBounds` API surface for a value nothing reads.
+
+**`assets/maps/coimbatore/style_template.json`** (new): a real MapLibre style-spec v8 document, 16 layers, authored entirely from Phase 1's actual `Color.kt` hex values (re-read directly, not from memory) -- background/landuse/landcover in navy tones, water in `NavySurface`, roads tiered by class (motorway/trunk in `CyanPrimary`, primary/secondary in `VioletSecondary`, minor in `TextMuted`, paths/rail dashed in `Outline`), buildings in `NavyElevated` with an `Outline` stroke, parks as a subtle `StatusGood`-tinted fill. **Text labels (place names, road names, POI names) are deliberately not included** -- MapLibre's `SymbolLayer` text rendering needs a local glyph/font PBF source to work fully offline, and generating one is a separate, unresearched asset-generation problem this session did not attempt; POI/place points are still shown as plain circles (no text) so the omission is partial, not total, and is disclosed here rather than silently dropped.
+
+**`MapView.kt`** fully rewritten. The Compose function signature is byte-for-byte unchanged -- re-verified directly against `NavigationScreen.kt`'s actual call site before writing a line of this file -- so `NavigationScreen.kt` needed zero changes. Every feature preserved: the Phase-3 precision-safe marker glide and uncertainty-radius smoothing (unchanged math, only the render target changed from an osmdroid `Marker`/`Polygon` to a MapLibre `SymbolLayer`/`GeoJsonSource`); the dual naive-vs-corrected trail overlay during blackout (two `GeoJsonSource`+`LineLayer` pairs, same show/hide-on-blackout logic); the offline-only constraint (nothing in this file or the style references a network URL -- the vector source and the style itself are both local `file://`/`mbtiles://file://` URIs). Ported osmdroid's `Polygon.pointsAsCircle()` math by hand into a `circlePolygonGeoJson()` helper (MapLibre has no built-in geo-radius circle primitive -- `CircleLayer`'s radius is in screen pixels, not meters, confirmed via research before assuming otherwise). `isDarkMode` kept in the signature for compatibility but is now a no-op, documented as such: the old raster tiles needed a runtime color-matrix filter to fake dark mode; the new vector style is already permanently dark navy by design.
+
+**A deliberate architecture trade-off, not a silent default:** MapLibre has an official, separate "MapLibre Compose" library, found mid-implementation via research. Evaluating and adopting it would have meant restarting version/maturity research from zero on a second, differently-versioned artifact. Chose instead to keep the classic View-based `org.maplibre.android.maps.MapView` wrapped in `AndroidView` -- the same integration pattern this file already used for osmdroid, verified method-by-method against MapLibre's real API reference (`Style.addLayerBelow`, `getSourceAs`/`getLayerAs`, `CameraUpdateFactory`'s methods, the `MapView(Context)` constructor, and the `onCreate(Bundle?)` nullability all independently confirmed via direct KDoc/example fetches this session, not assumed). Lower delta from the existing architecture, and every piece of it is now verified against real documentation, unlike an unresearched second library would have been.
+
+**`build.gradle.kts` / `libs.versions.toml`:** added `org.maplibre.gl:android-sdk:13.6.1`; removed the now-fully-unused `osmdroid-android` dependency and its version catalog entries (confirmed via `grep -rln "org.osmdroid"` returning zero files after the migration).
+
+**Attribution:** added as a second line inside the existing always-visible top-left "COIMBATORE OFFLINE" badge in `MapView.kt`, rather than a new floating element that could collide with `NavigationScreen.kt`'s own overlays -- satisfies OSMF's legible/corner/no-interaction-required requirements without adding new collision risk.
+
+**A related discrepancy found, flagged rather than acted on:** `map/MapMatcher.kt` (distinct from the separate, untouched `navigation/MapMatcher.kt` that `DeadReckoningEngine.kt` uses) is now fully unreferenced -- confirmed via grep. It was already effectively dead before this session too: the old `MapView.kt` only ever called its `getRoads()` (to draw a supplementary road overlay, now redundant since vector tiles render roads natively), never its real `match()` road-snapping algorithm. Not deleted this session -- its content is substantive position-correction algorithm logic, adjacent enough to "backend logic" that this session judged it out of scope to remove unilaterally, even though it lives under `map/` not `navigation/`. Left for a future, explicit decision.
+
+### Compile verification
+
+Ran `./gradlew.bat compileDebugKotlin -q` (without `--offline`, since resolving a brand-new dependency for the first time is a genuinely different case from recompiling with already-cached dependencies). Failed identically to every prior attempt: `java.io.IOException: Unable to establish loopback connection`, before reaching dependency resolution or the Kotlin compiler at all. In place of a build: balanced brace/paren counts on both rewritten files (`MapView.kt`: 89/89 braces, 290/290 parens; `OfflineMapManager.kt`: 55/55 braces, 118/118 parens); every import cross-checked against actual usage in both files; and, uniquely for this session, several specific MapLibre API details (constructor overloads, method names, nullability, exact class locations) were individually verified against MapLibre's real API reference pages rather than trusted from memory -- the same discipline that caught real mistakes in §38/§40, applied here preemptively instead of after a build failure, precisely because no build is available to catch them after the fact this time.
+
+### Scope discipline
+
+Touched: `app/build.gradle.kts`, `gradle/libs.versions.toml`, `app/src/main/java/com/example/gudumap/map/OfflineMapManager.kt`, `app/src/main/java/com/example/gudumap/ui/components/MapView.kt`. New: `app/src/main/assets/maps/coimbatore/style_template.json`. Not touched: `NavigationScreen.kt` (confirmed unchanged, by design), `DeadReckoningEngine.kt`, `navigation/MapMatcher.kt`, or anything else under `navigation/`.
+
+### Still not verified -- more than any prior phase, said plainly
+
+**The single biggest gap:** the real vector `coimbatore.mbtiles` file does not exist. Until it's generated on a machine with Java 21+ and dropped into `assets/maps/coimbatore/`, `OfflineMapManager.status` will read `NOT_AVAILABLE` on a real device and the map will show no vector data -- this is expected, not a bug, and is exactly what `resolveStyleUri()` returning `null` and the `Log.e` in `MapView.kt`'s factory block are for. **Everything else is unverified because there is no build and no real device:** whether the MapLibre API calls used here are correct at all (every one was checked against documentation, none against a compiler); whether the classic-View-in-`AndroidView` lifecycle wiring actually initializes and tears down cleanly across Compose recomposition and Activity pause/resume; whether the style JSON's layer ordering, filters, and colors actually render as intended once real data exists; whether the hand-ported circle-polygon math is visually correct; and whether MapLibre's native rendering (OpenGL/Vulkan-backed, unlike osmdroid's simpler tile-drawing) performs acceptably on the kind of device this will be demoed on. This phase carries meaningfully more unverified surface area than §35-§41 combined, and should be treated that way, not glossed over with the same "manually reviewed" language used for smaller changes.
+
+## 43. 2026-09-18 (continued) — the stale raster file masquerading as real data is fixed; a second, independent attempt at real vector tile generation (tippecanoe, chosen specifically to avoid Planetiler's JVM dependency) hits a different but equally hard, equally well-confirmed blocker -- stopped per explicit instruction rather than reached for a placeholder
+
+### The actual root cause of the "map renders empty" symptom
+
+Inspected `app/src/main/assets/maps/coimbatore/coimbatore.mbtiles` directly with a real SQLite query rather than assuming: `metadata` table's `format` row reads `png`, 915 tiles total -- an exact match for the OLD, pre-§42 raster file's known signature (`915 tiles: 11=4, 12=12, 13=30, 14=110, 15=399, 16=360`, documented back in §22), dated Sep 5, weeks before the §42 migration. **This is definitively the stale raster file, sitting under the exact filename `OfflineMapManager.kt` now expects a vector file at.** `resolveStyleUri()`/`getMbtilesSourceUri()` find it, report `AVAILABLE`, and hand MapLibre a `mbtiles://file://` URL pointing at raster PNG blobs a vector-tile parser cannot read as vector data -- each tile request fails silently per-tile rather than throwing, which is exactly why the map renders empty instead of erroring loudly.
+
+**Fixed:** renamed (not deleted -- it's real, working, verified raster data, kept as a reference/rollback point rather than discarded) to `coimbatore_RASTER_LEGACY.mbtiles`. `OfflineMapManager.kt` now correctly finds no `coimbatore.mbtiles` asset and reports `NOT_AVAILABLE` -- the honest state, matching reality, instead of a wrong-format file silently masquerading as good data.
+
+### Second attempt at real tile generation: tippecanoe, to sidestep §42's Java-version blocker
+
+Checked this sandbox's actual toolchain before assuming anything, since the last attempt (Planetiler) failed on a JVM version mismatch, not a fundamental impossibility -- tippecanoe (C++, no JVM at all) is a genuinely different class of tool that could plausibly sidestep that specific problem.
+
+**What's actually here, checked directly:** no package manager of any kind (no apt/pacman/choco/winget/brew/vcpkg -- confirmed by `which` returning nothing for all of them). But a real, complete, self-consistent modern C++ toolchain exists under `/c/msys64/ucrt64/`: `g++.exe` 14.2.0 (full C++17/20/23 support, released 2024), `mingw32-make.exe`, and both `sqlite3.h`/`zlib.h` headers **and** their compiled libraries (`libsqlite3.a`, `libz.a`) -- everything tippecanoe's own documented build dependencies ask for, all mutually compatible (same toolchain, not a mismatched mix). This is meaningfully better-equipped than expected going in.
+
+**The actual, confirmed blocker: tippecanoe requires `mmap`, a POSIX API, and this environment has no implementation of it anywhere.** Checked both `/c/msys64/ucrt64/include/` and the plain MSYS runtime's `/usr/include/sys/` for `mman.h` (the header that would declare a `mmap` compatibility shim) -- present in neither. Cross-checked against an independent source (a GitHub project's own Windows-porting notes for this exact tool): **"The primary blocker for a native Windows port is that mmap is not provided by MinGW-w64... tippecanoe is deeply POSIX-coupled; virtually every layer of system integration -- threading, file I/O, process spawning, memory management -- uses Unix-only APIs."** No official Windows binary exists (confirmed via search -- pip/pipx-distributed prebuilt binaries cover macOS and Linux only). The tool's own documented options for non-Linux/macOS platforms are WSL, Cygwin, or Docker -- **none available in this sandbox** (`docker`: not found; WSL: not something this Bash/MSYS shell can invoke or verify installed, and enabling it would be a significant system-level action outside this task's scope; Cygwin: a whole separate POSIX compatibility layer, not currently installed, and installing one just to build a single tool is the same order of unrequested infrastructure change as installing a new JDK would have been for Planetiler).
+
+**Network access was separately re-confirmed fine, so it is not the limiting factor either way:** `curl` reached Geofabrik (HTTP 200), BBBike's custom-extract service (HTTP 200), and Overpass (HTTP 406 -- a wrong-endpoint response from a live server, not a block). Both attempted tools failed for toolchain reasons specific to each: Planetiler needs a JVM this sandbox doesn't have at the required version; tippecanoe needs a POSIX kernel facility Windows/MinGW doesn't provide and no compatibility layer here supplies.
+
+### Stopped here, per explicit instruction
+
+Did not attempt to patch tippecanoe's source to remove its `mmap` dependency (a large, speculative, error-prone rewrite of a build system for a tool whose entire job is producing spatially-correct output -- exactly the kind of thing that shouldn't be improvised under time pressure), install WSL or Cygwin (significant, invasive system changes, unrequested and out of proportion to this task), or generate any placeholder/partial `coimbatore.mbtiles` -- doing the latter would have recreated today's exact silent-empty-map bug in a new form, which this session exists specifically to prevent. **The real vector tile data still does not exist and still requires a machine with either a JDK 21+ (for Planetiler) or a genuine POSIX environment such as Linux, macOS, WSL, or a Docker container (for tippecanoe).**
+
+### Scope discipline
+
+Touched: `app/src/main/assets/maps/coimbatore/coimbatore.mbtiles` (renamed to `coimbatore_RASTER_LEGACY.mbtiles`). No source file changed this session -- `OfflineMapManager.kt`'s existing logic already does the right thing once the stale file is out of the way; no code fix was needed, only the file-level correction the task asked for.
+
+### Still not verified
+
+Everything §42 already flagged as unverified remains exactly as unverified -- this session fixed a data-masquerading bug and ruled out a second tile-generation tool with equal rigor to the first, but did not and could not produce real map data or a real build. The map will still show no vector tiles on a real device until the data is generated elsewhere.
+
+## 44. 2026-09-18 (continued) — real vector tile data generated for the first time in this whole migration: the user manually set up Planetiler on the actual machine (`D:\Planetier\`, note the folder's own name is missing an "l"), a real Coimbatore `.osm.pbf` arrived via BBBike, and a genuine JDK 21 was found and used; a fresh Gradle build attempt in this sandbox hits the exact same loopback restriction as every prior session, confirming §38-40's "real build signal" always came from the user's own Android Studio, never from this sandbox
+
+### What was actually present, checked directly rather than assumed
+
+`D:\Planetier\` (not `D:\Planetiler\` -- the task's own text had the typo, the user corrected it) contained `planetiler.jar` (93,278,824 bytes), an empty `output\`, and `data\planet_76.191,10.217_77.758,11.407.osm.pbf` (~43MB, dated Sep 18) -- a real BBBike extract. Its filename-embedded bounding box (76.191,10.217 to 77.758,11.407) was checked against `OfflineMapManager.COIMBATORE_BOUNDS` (76.880-77.070E, 10.915-11.125N) and covers it with generous margin.
+
+**JDK 21, confirmed not assumed:** plain `java -version` on PATH is still `17.0.17` (Temurin) -- the same version that has blocked this migration before. A separate real Java 21 install exists at `C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot\bin\java.exe`, confirmed via direct `-version` invocation: `openjdk version "21.0.12.1" 2026-08-18 LTS`, `Temurin-21.0.12.1+1`. All Planetiler runs below used this exact binary, not PATH `java`.
+
+### A more precise version of the known loopback restriction: it's not Gradle-specific, it's the JVM's own networking
+
+Running Planetiler with only `--osm-path`/`--output` failed fast and honestly: `IllegalArgumentException: data\sources\lake_centerline.shp.zip does not exist. Run with --download to fetch it` -- Planetiler's default OpenMapTiles profile needs three auxiliary global datasets (lake centerlines, split water polygons, Natural Earth vectors) beyond the raw OSM extract. Adding `--download` produced `java.io.IOException: Unable to establish loopback connection` from inside `java.net.http.HttpClientImpl` -- **the same class of restriction that has blocked Gradle daemons all project long, now confirmed to also break Java's own built-in HTTP client**, not just Gradle's. `curl`, a separate non-JVM process, is completely unaffected and has full outbound network access.
+
+**Workaround:** read Planetiler's own debug output for its real default source URLs (not a web search, which suggested wrong test-fixture URLs), fetched all three manually with `curl` straight into the `data/sources/` paths Planetiler expects, then re-ran without `--download`:
+- `lake_centerline.shp.zip` (80,906,805 bytes) from `acalcutt/osm-lakelines` -- clean on the first attempt.
+- `natural_earth_vector.sqlite.zip` (434,210,731 bytes) from `naciscdn.org` -- truncated by a 300s `curl -m` timeout on the first attempt (confirmed corrupt via Python's `zipfile` raising "File is not a zip file"), completed after resuming with `curl -C -m 900`.
+- `water-polygons-split-3857.zip` (929,862,726 bytes) from `osmdata.openstreetmap.de` -- truncated the same way once, then hit a server-side `curl: (56) Recv failure: Connection was reset` on the first resume; completed on a second resume adding `--retry 5 --retry-delay 5`.
+
+All three verified as structurally valid ZIPs (4, 4, and 6 entries respectively) before the real Planetiler run.
+
+### The real Planetiler run, including one genuine memory failure and its fix
+
+First real attempt, `-Xmx1g`, all sources local, no `--download`: `java.lang.OutOfMemoryError: Java heap space` during `osm_pass1` (visible in the `LongArrayList`/`Arrays.copyOf` stack trace) -- left a 4096-byte stub output, deleted rather than mistaken for real data. `systeminfo` reported only ~1.7GB available of 15.8GB total at that instant. Retried with `-Xmx4g`, exactly as the task's own instructions anticipated ("increase -Xmx if it fails on memory") -- succeeded, exit code 0:
+
+```
+"/c/Program Files/Eclipse Adoptium/jdk-21.0.12.101-hotspot/bin/java.exe" -Xmx4g -jar planetiler.jar --osm-path="data/planet_76.191,10.217_77.758,11.407.osm.pbf" --output="output/coimbatore.mbtiles"
+```
+
+Console output ended with `archive 40MB`, `features 151MB`, and Planetiler's own printed licensing notice: *"Maps made with these vector tiles must display a visible credit: © OpenMapTiles © OpenStreetMap contributors."*
+
+### Verification, reusing §43's exact SQLite methodology against the new file
+
+`output/coimbatore.mbtiles` is 40,026,112 bytes. Queried directly, not trusted on size alone:
+- `metadata.format = pbf` (vector, not the raster `png` that fooled §43's stale file check).
+- `name = OpenMapTiles`, `version = 3.16.0`, `planetiler:version = 0.10.2`, `compression = gzip`.
+- `attribution` embeds both required credits: `... &copy; OpenMapTiles ... &copy; OpenStreetMap contributors`.
+- `bounds = 76.191,10.217,77.758,11.407`, `minzoom = 0`, `maxzoom = 14` -- confirming exactly what §-era speculation in `OfflineMapManager.kt` had guessed a default OpenMapTiles build would produce.
+- `SELECT COUNT(*) FROM tiles` → `5518`, distributed across zoom 0-14 (`(0,1) ... (13,1073) (14,4032)`), a real, complete zoom pyramid, not a partial or single-zoom stub.
+- First tile blob's first 4 bytes are `1f8b0800` -- the correct gzip magic number, matching the declared `compression: gzip`.
+
+This is genuine, complete, correctly-schemed vector tile data -- not a placeholder, not a wrong-format file, not a partial pyramid.
+
+### Copied into the app, attribution gap found and fixed
+
+Checked the destination first, per the task's own caution: `app/src/main/assets/maps/coimbatore/` contained only `coimbatore_RASTER_LEGACY.mbtiles`, `coimbatore_roads.json`, and `style_template.json` (§43's end state) -- no file named `coimbatore.mbtiles` existed to be silently overwritten. Copied the verified file in; now 40,026,112 bytes at that path, replacing nothing.
+
+Planetiler's own printed credit line revealed a real gap in [MapView.kt](gudumap/app/src/main/java/com/example/gudumap/ui/components/MapView.kt) that no prior session could have caught, since no real OpenMapTiles-schema output existed yet to reveal it: §42's attribution badge said only `"© OpenStreetMap contributors"`, satisfying OSMF's own guideline but missing the separate "© OpenMapTiles" credit that this schema's own license requires (confirmed twice over -- both Planetiler's console output and the generated file's own `attribution` metadata). Fixed: the badge now reads `"© OpenMapTiles © OpenStreetMap contributors"`, with the comment explaining why this was missed before.
+
+Separately, updated [OfflineMapManager.kt](gudumap/app/src/main/java/com/example/gudumap/map/OfflineMapManager.kt)'s `MIN_ZOOM`/`MAX_ZOOM` comment, which had speculated "re-verify... once the real file exists" -- replaced with the confirmed `maxzoom = 14` result above; `MAX_ZOOM = 16` is kept as a deliberate two-level overzoom for the existing interactive range, not dropped to match native data.
+
+### Task 6: a real Gradle build was attempted here, and it failed the same way it always has
+
+Ran `./gradlew assembleDebug` with `JAVA_HOME` pointed at the confirmed real JDK 21 (`C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot`), now that real map data exists for the first time. Result: `java.io.IOException: Unable to establish loopback connection` -- the identical failure mode documented since §34/§38, unaffected by JDK version or by the presence of real data. **This settles a question the task itself raised: §39-40's "real build signals" never came from this sandbox -- they came from the user's own separate Android Studio.** This sandbox's own Gradle daemon has never once completed a build in this entire project, on any JDK, with or without real assets. The compile-correctness of everything since §36 (including this session's two small edits) is therefore still only verified by manual reading, not by a real compiler, in this specific environment.
+
+### Scope discipline
+
+This session's actual edits, checked against `git diff --stat`, not assumed: [OfflineMapManager.kt](gudumap/app/src/main/java/com/example/gudumap/map/OfflineMapManager.kt) (one comment block, `MIN_ZOOM`/`MAX_ZOOM`), [MapView.kt](gudumap/app/src/main/java/com/example/gudumap/ui/components/MapView.kt) (one attribution string + its comment), and `coimbatore.mbtiles` replaced with real data (13.9MB stale raster → 40MB real vector, binary diff). Both `.kt` files carry substantial additional uncommitted diffs from §42/§43's earlier, larger migration work already sitting in the working tree before this session started -- not attributable to this entry. No other source file touched.
+
+### Still not verified
+
+Real device/emulator rendering of the new vector tiles is still unverified -- this sandbox cannot run an emulator any more than it can run Gradle. Whether `assembleDebug` actually succeeds is still only knowable from the user's own Android Studio, the same as every build-correctness question since §39. The map now has real, verified data behind it for the first time, but "compiles and renders correctly on a device" remains exactly as unconfirmed in this sandbox as it was in §42/§43 -- only the data layer changed today, not the verification method.
+
+
+## 45. 2026-09-18 (continued) — found and fixed why the map still rendered blank even with real vector tile data now present: `OfflineMapManager.kt` was building an `mbtiles://file://<path>` source URI, which is rejected outright by MapLibre Native's actual `MBTilesFileSource`
+
+§44 confirmed real, valid vector tile data now exists (`coimbatore.mbtiles`, 5,518 tiles, format `pbf`, verified via SQLite) and is bundled into the app. The user reported the map was still blank after that. Read `OfflineMapManager.kt` and `MapView.kt` directly (both on the user's machine via the device bridge, not from any stale cloud-workspace copy) rather than assuming §42/§43's prior claims about the URL scheme were correct.
+
+### What was actually wrong, verified against the real pinned dependency source, not documentation or memory
+
+`getMbtilesSourceUri()` returned `"mbtiles://file://${file.absolutePath}"`. §42's doc comment had claimed this exact form was "confirmed via MapLibre's own GitHub discussions" and "maintainer-endorsed" — that claim was never actually checked against the library's own code, and is wrong.
+
+Cloned `maplibre/maplibre-native` and checked out the exact tag the app depends on (`org.maplibre.gl:android-sdk:13.6.1` → tag `android-v13.6.1`, commit `c7506d6`) rather than trusting `main` or a web search summary. In `platform/default/src/mln/storage/mbtiles_file_source.cpp`, `MBTilesFileSource::request()`:
+- strips only the literal `"mbtiles://"` prefix (10 characters, `MBTILES_PROTOCOL` in `constants.hpp`) — it does **not** also strip a following `"file://"`;
+- then requires what remains to pass `util::is_absolute_path()`, which (confirmed by reading `filesystem.cpp`, both the `std::filesystem` and fallback `path.at(0) == '/'` implementations) is simply "does the string start with `/`".
+
+For the app's URL, what remains after stripping `"mbtiles://"` is `"file:///data/user/0/com.example.gudumap/files/maps/coimbatore/coimbatore.mbtiles"` — starts with `f`, not `/`, so `is_absolute_path()` returns false and the request is rejected immediately with `"MBTilesFileSource only supports absolute path urls"`, before the tile source (or its tilejson) is ever loaded. Reproduced the exact failure locally with a Python `os.stat()` call on the same malformed string to confirm it isn't a filesystem path at all, just a string that happens to contain one. Also checked `request_tile()` in the same file to rule out gzip compression as a contributing cause (this mbtiles' tiles are gzip-`pbf`, confirmed via `compression=gzip` in its metadata and a literal `1f8b` magic-number check in §44) — `request_tile()` already calls `util::is_compressed()` / `util::decompress()` on every tile blob, so compression was never the problem; the source never got far enough to reach `request_tile()` at all.
+
+### Fix
+
+`getMbtilesSourceUri()` now returns `"mbtiles://${file.absolutePath}"` (single prefix; `File.absolutePath` on Android already starts with `/`, so the result is the correct `mbtiles:///data/user/0/.../coimbatore.mbtiles` form — three slashes total, not from doubling `file://` but from `mbtiles://` + a path that itself starts with `/`). Corrected the doc comments in both `OfflineMapManager.kt` and `MapView.kt` that had asserted the old, wrong form was verified-correct, replacing them with this entry's actual verification trail.
+
+### Scope discipline
+
+Only `OfflineMapManager.kt` (the `getMbtilesSourceUri()` method body + 4 doc-comment blocks) and `MapView.kt` (2 doc-comment lines, no code) were touched this session. Grepped the full `app/src/main/java` tree afterward for `mbtiles://file://` — zero remaining occurrences outside the two comment lines that now describe the old broken form for context.
+
+### Still not verified
+
+Same caveat as §39-44: this sandbox has no Gradle/emulator access (confirmed again failing with the same loopback restriction), so whether the map now actually renders roads/water/buildings on a real device is unverified from here. This is a source-level fix confirmed correct against the exact pinned library version's own logic, not yet confirmed by an actual build+run. The user needs to rebuild in their own Android Studio and run on a device/emulator to close this loop.
+
+
+## 46. 2026-09-18 (continued) — `FINAL_AUDIT_SUMMARY.md` fully regenerated from current, post-heading-leak-fix data; its headline "9.10% drift @ 120s" claim is retracted
+
+Flagged as stale since the Sep 13 pre-screening brief (Ask 4, item 1): the document was dated 2026-09-06, predating §31's heading-leak fix (2026-09-08) and §33's Baseline 9 addition (2026-09-14), and its headline number no longer matched the live benchmark data.
+
+### What was actually done, not just a patch
+
+Rather than editing the old numbers in place, recomputed every result-dependent section directly from the current source files: `real_benchmark_all_test_sequences.csv` (288 rows, 32 outage combinations × 9 baselines, regenerated 2026-09-14) and both aggregate CSVs (same date). Cross-checked the recomputed `drift_percent_endpoint` median/mean against the aggregate CSVs' own `drift_median`/`drift_mean` columns (exact match) before trusting the column choice, and cross-checked the aggregate numbers themselves against the ones already quoted in the Sep 13 brief (also an exact match) before building on them.
+
+### The headline claim did not survive
+
+The original document's lead number — `vw16a`, 120s outage, ML-only baseline, 9.10% drift, described as the system's best result — is **60.12%** under the corrected methodology, a 6.6x change entirely attributable to the heading-leak fix (that sequence is highway driving, so heading matters a lot for a rotated-displacement ML prediction, unlike the near-stationary `vw15` case which barely moved). Retracted explicitly in the new document's §7, with the actual current-best 120s-moving ML result reported instead (`vfa02`, 27.71%, still not a strong number).
+
+### New finding surfaced in the process, not present in the original document
+
+Added a Baseline 9 threshold table (§5 of the new doc) that wasn't computable when the original was written: physics-only B9 (INS+EKF+NHC+ZUPT) clears the <10%-drift bar on 9/32 (28.1%) of all evaluations vs. the best ML baseline's 3/32 (9.4%) — roughly 3x. This is a cleaner, more legible piece of evidence for the physics-primary decision than anything in the original document, and is now the document's actual headline finding in place of the retracted one.
+
+### Also checked and corrected while in there
+
+- §9 (leakage audit): confirmed the residual heading leak in `run_real_io_vnbd_benchmark.py` (flagged non-blocking in the Sep 13 brief) is still present (5 unguarded `gt_hdg[i]` reads) but traced its exact call graph — the 4 symbols `run_all_test_sequences_benchmark.py` imports from that file (`RealIOVNBDSequence`, `geodetic_to_ned_vec`, `ned_to_geodetic_vec`, `precompute_ml_displacements`) are none of the 5 functions containing the leak, all of which live in that file's own unused `run_benchmark()`. Confirmed via `grep -n` line numbers against `grep -n "^def "`, not assumed from the brief's earlier claim.
+- §10 (ONNX/Android): the original document said Android integration was "PENDING" against a `[1, 200, 6]` contract. Read `ModelMetadata.kt` directly: `WINDOW_SIZE = 20`, `[batch, 20, 6]` — integration is actually done and has been since before this session, per the Sep 13 brief. Corrected. Also confirmed via `md5sum` that the model bundled in the Android app and the one in `dead_reckoning/models/` are byte-identical, so the existing ONNX-vs-PyTorch parity numbers (a property of that unchanged file) didn't need recomputation.
+- Sections 2–3 (raw dataset composition) were carried forward without a fresh count-by-count re-audit this pass — flagged explicitly in the new document's §0 rather than silently presented as re-verified, since a quick `ls`-based recount against the actual nested `IO-VNBD` folder structure didn't resolve in the time available and re-deriving it wasn't this task's point.
+
+### Scope discipline
+
+Only `results/io_vnbd/FINAL_AUDIT_SUMMARY.md` was rewritten this entry. No source code, no CSVs, no other docs touched.
+
+### Still not verified
+
+Everything in the new document is derived from files already regenerated by prior sessions (§31 fix, §33/44 reruns) — this entry did not re-run the benchmark itself, only recomputed statistics from its existing output and verified those computations independently (matching the pre-existing aggregate CSVs and the Sep 13 brief's quoted numbers as a cross-check). If those underlying CSVs are ever regenerated again, this document will need another pass.
+
+
+## 47. 2026-09-18 (continued) — road/place/water/POI text labels added to the MapLibre style; required bundling real offline SDF glyph fonts, since MapLibre Native cannot rasterize Latin text without one
+
+User confirmed §45's fix worked: real vector tiles now render (roads, water, buildings, all visible in a device screenshot) but with **no text anywhere** -- no street names, no place names. Investigated rather than guessing at a quick style tweak, since the previous two blank-map bugs (§42-45) had each turned out to be a specific, non-obvious integration gap rather than a style authoring mistake.
+
+### Root cause: two separate, both-necessary gaps, not one
+
+1. **`style_template.json` never defined any `symbol` layers.** Its 16 layers were all `background`/`fill`/`line`/`circle` -- `poi-point` and `place-point` drew circles for POIs and places, never text. There was structurally nothing to show a name even if MapLibre could render one.
+2. **Even with symbol layers, MapLibre Native cannot draw Latin text without a real glyph source.** Checked `mln::LocalGlyphRasterizer` (`platform/android/.../text/local_glyph_rasterizer.cpp` and `src/mln/util/i18n.cpp`'s `allowsFixedWidthGlyphGeneration()`, both read directly from the same `android-v13.6.1`-tagged source used for the §45 investigation) -- Android's on-device local glyph fallback only covers CJK/Hangul/Bopomofo/Yi codepoints (it draws those live via `android.graphics.Typeface` since their metrics are guessable; the same file's own comment says so). Latin script is explicitly excluded. Without a real `"glyphs"` URL in the style, every `text-field` would have silently placed nothing, no error, same failure shape as §45's blank map.
+
+### Getting real glyph data, offline, without repeating §45's mistake
+
+Needed real SDF glyph range files (`{fontstack}/{range}.pbf`) bundled in-app, and needed to get the URL scheme right the first time given how much §45 cost from getting `mbtiles://` subtly wrong. Traced the actual request path in the same cloned source: `Resource::glyphs()` percent-encodes `{fontstack}` and fills in `{range}` before dispatch; `mln::LocalFileSource` (the same file-source class already proven working for this app's `style.json` itself via `file://`) accepts any `file://<absolute-path>` URL, percent-decodes it, and reads it directly -- no doubled-scheme trap this time, confirmed against source before writing any Kotlin.
+
+Real glyph files don't ship pre-built anywhere reachable from this sandbox: `fonts.openmaptiles.org` (the standard CDN for pre-rendered glyph PBFs) is blocked by this org's egress allowlist from both the device's own shell and this sandbox. Generated them instead, for real, from a real font: cloned `openmaptiles/fonts` (raw `.ttf`/`.otf` source fonts, `raw.githubusercontent.com` *is* reachable), installed Mapbox's `fontnik` (the actual production tool used to build those CDN files -- rasterizes with FreeType, encodes as SDF protobuf, same format MapLibre expects), and generated real `0-255.pbf` (75,624 B) and `256-511.pbf` (126,827 B) range files from `NotoSans-Regular.ttf` -- Basic Latin, Latin-1 Supplement, and Latin Extended-A/B, which covers the English-tagged OSM names this Coimbatore extract actually has. Committed both directly into `gudumap/app/src/main/assets/fonts/Noto Sans Regular/` on the user's machine (md5-verified after transfer, not just assumed intact).
+
+### Code changes
+
+- `OfflineMapManager.kt`: added `copyGlyphs()` (mirrors the existing `coimbatore.mbtiles` copy-out-of-assets-into-internal-storage pattern exactly, including the §26 re-copy-on-size-mismatch logic), `getGlyphsUrlTemplate()`, and wired both into `resolveStyleUri()`'s existing `{{MBTILES_URL}}` substitution alongside a new `{{GLYPHS_URL}}` token. Glyph-copy failure is caught and logged, not fatal -- the map's tiles/roads still render even if a font file goes missing, same fail-soft posture as the rest of this class.
+- `style_template.json`: added `"glyphs": "{{GLYPHS_URL}}"` at the style root, and four new `symbol` layers -- `road-label` (`transportation_name`, line-placed, minzoom 13, excludes `path`/`rail`), `place-label` (`place`, uppercase, size scales by `class`, maxzoom 14), `water-label` (`water_name`, minzoom 12), `poi-label` (`poi`, minzoom 16, `text-optional` so it never blocks placement of anything else). All reference `text-font: ["Noto Sans Regular"]`, matching the bundled fontstack folder name exactly (required for the round-trip percent-encode/decode to resolve to the real directory). Colors chosen to match the existing palette (`#CBD5E1` road labels, `#E8EAF6` place labels) with dark halos for legibility over the fill/line layers already there. Validated the edited JSON with `json.load()` before considering this done, not just by eye.
+- `app/build.gradle.kts`: added `"pbf"` to `noCompress`, alongside the existing `mbtiles`/`sqlite`/`onnx`/`json` entries -- for the same reason those are there: `copyGlyphs()` calls `assets.openFd(...).length` for its own size-mismatch check, and `openFd()` throws on a compressed APK asset entry. Without this, glyph copying would still work (the code already falls back to an imprecise `available()`-based size estimate) but would likely recopy on every launch rather than just the first.
+
+### Scope discipline
+
+Touched: `OfflineMapManager.kt` (2 new methods + 2 call sites), `style_template.json` (root `glyphs` field + 4 new layers, 16 existing layers untouched), `build.gradle.kts` (1-entry noCompress addition), plus 2 new binary asset files. `MapView.kt` was not touched -- label layers are static style content, not per-frame dynamic state, so nothing in its `update` block needed to change.
+
+### Still not verified
+
+Same caveat as every entry since §39: this sandbox cannot run Gradle or an emulator. The `mbtiles://` fix in §45 was confirmed correct by reading the exact pinned library source, and it turned out to be right when the user actually rebuilt -- the glyphs fix follows the identical verification method (read the real, version-matched source before writing the Kotlin, not the doc-comment-first mistake that caused the original bug), but "labels actually render on a real device" is still open until the user rebuilds and looks.
+
+
+## 48. 2026-09-18 (continued) — found why road labels specifically (not place labels) never rendered: the road-label layer's filter used `"!in"`, which MapLibre's own filter converter never treats as a modern expression, and the nested-`get`/`literal` shape it was written in isn't valid legacy-filter syntax either
+
+Device screenshots from the actual rebuilt app (first real evidence since §47) showed the glyph/label pipeline from §47 genuinely works -- `KUNIAMUTHUR`, `KOVAIPUDUR`, `MADUKKARAI` all render as real uppercase place-name text on the live map. That rules out every hypothesis §47's handoff prompt raised (asset packaging, `copyGlyphs()` execution, the glyphs URL round-trip) -- all of it works. But road/street names specifically still didn't render, while `place-label` did. That specific split -- one symbol layer working, a near-identical sibling not -- pointed at something particular to `road-label`, not the shared glyph/font machinery.
+
+### Found by reading the exact parser code, not by guessing at style JSON
+
+`road-label` was the only new layer with a `filter`:
+```
+["!in", ["get", "class"], ["literal", ["path", "rail"]]]
+```
+Read `mln::style::conversion::Converter<Filter>` in the pinned `android-v13.6.1` source (`src/mln/style/conversion/filter.cpp`), specifically its `isExpression()` dispatcher, which decides whether a filter array is parsed as a modern expression or the old legacy-filter grammar:
+```cpp
+} else if (*op == "!in" || *op == "!has" || *op == "none") {
+    return false;   // never treated as a modern expression
+```
+Any filter whose first element is the literal string `"!in"` is unconditionally routed to legacy-filter parsing, **regardless of what the rest of the array actually contains**. Legacy-filter syntax expects `["!in", "<property-name-as-plain-string>", val1, val2, ...]` -- but this filter's second element was `["get", "class"]` (a nested expression array, the modern-expression way of referencing a property), not a plain string. Cross-checked `src/mln/style/expression/parsing_context.cpp`'s `expressionRegistry` too: it registers `"in"` but has no `"!in"` entry at all, confirming there is no expression-level interpretation of `"!in"` to fall back to either way. The net effect: this filter fails to parse under the only grammar it's actually routed to, the layer never becomes valid, and it renders nothing -- silently, no exception surfaces to the app, consistent with every symptom observed so far (§47's handoff prompt couldn't find anything wrong from source alone because the bug was a spec-conformance issue in a style file, not a code-logic bug `OfflineMapManager.kt`/`copyGlyphs()` type reasoning could catch).
+
+`place-label`, `water-label`, and `poi-label` never had a `filter` at all, which is exactly why they were unaffected and rendered correctly -- confirming this diagnosis rather than just being consistent with it.
+
+### Fix
+
+Replaced the filter with the form every other pre-existing layer in this file already uses successfully (`road-minor`/`road-secondary`/etc. all use `["in", ["get","class"], ["literal",[...]]]`, confirmed registered: `"in": In::parse`):
+```
+["all", ["!=", ["get", "class"], "path"], ["!=", ["get", "class"], "rail"]]
+```
+`"all"` and `"!="` are both directly confirmed in `expressionRegistry` (`{"all", All::parse}`, `{"!=", parseComparison}`) -- no reliance on an unverified fallback path this time. Re-parsed the edited `style_template.json` with `json.load()` after the change (as with every prior JSON edit this project) and grepped the whole file for any other `"!in"` occurrence -- none found; this was the only one.
+
+### Scope discipline
+
+One filter array in `road-label` inside `style_template.json`. No other layer, no Kotlin, no other file touched this entry.
+
+### Still not verified
+
+Same as every entry since §39: no Gradle/adb/device access in this sandbox. This diagnosis is source-level-certain (the filter is definitively invalid MapLibre style-spec JSON, confirmed against the exact pinned parser code, not inferred) but "road labels now actually render on the real device" still needs the user's next rebuild to confirm, the same way §45's `mbtiles://` fix and §47's glyph pipeline were each confirmed correct only once real device screenshots came back.
+
+## 49. 2026-09-18 — road-label still invisible after §48 filter fix: found the real cause (mergeLines() vs MultiLineString geometry), switched to line-center placement
+
+### What was actually done
+
+User confirmed the §48 filter fix (invalid `"!in"` → `["all", ["!="...]]`) did **not** fix the missing street labels — place labels render correctly on the real device (confirmed via screenshots: KUNIAMUTHUR, KOVAIPUDUR, MADUKKARAI), but road-label continued to render nothing.
+
+Re-verified §48 was genuinely still in place (fresh grep: zero `"!in"` occurrences in `style_template.json`). Re-checked the whole style JSON for structural issues: no duplicate layer `id`s (20 layers, all unique), `sources.coimbatore` has no `minzoom`/`maxzoom` cap (rules out source-level overzoom mismatch), and cross-checked the mbtiles' own per-layer zoom metadata (`transportation_name`: minzoom 8 / maxzoom 14; `place`: minzoom 2 / maxzoom 14) — both compatible with the style's zoom ranges, so zoom range is not the blocker.
+
+Also re-confirmed `resolveStyleUri()` in `OfflineMapManager.kt` rewrites `style.json` fresh from the bundled asset **every time it's called** (`context.assets.open(...)` → string-substitute → `styleFile.writeText(...)`, which overwrites, never appends/skips) — ruling out a stale-copy/caching bug for the style file itself. Since place-label (a brand-new layer, same rebuild) is confirmed working, the current APK build is genuinely picking up asset changes; this is not a build/deploy staleness issue.
+
+**Root cause found**, via direct read of the pinned MapLibre Native source (`/tmp/mln`, tag `android-v13.6.1`):
+
+`road-label` is the *only* one of the four label layers using `"symbol-placement": "line"` (place/water/poi all use the default point placement). In `src/mln/layout/symbol_layout.cpp`:
+
+```cpp
+if (layout->get<SymbolPlacement>() == SymbolPlacementType::Line) {
+    util::mergeLines(features);
+}
+```
+
+`mergeLines()` (`src/mln/layout/merge_lines.cpp`) is called **only** for `"line"` placement. It stitches adjacent same-named line segments together (e.g. a road split across several tile-internal segments) so a single label isn't repeated at every segment boundary — but it hard-codes a single-ring assumption throughout: every access is `geometry[0]` (`geometry[0].front()`, `geometry[0].back()`, `geometry[0].pop_back()`, `features[index].geometry[0].insert(...)`, etc.). It never looks at `geometry[1]`, `geometry[2]`, ... This is a direct, faithful port of mapbox-gl-js's `merge_lines.js`, which assumes each `transportation_name` feature is a single `LineString`.
+
+Directly decoded a real z14 tile from `coimbatore.mbtiles` (same tile used in earlier verification passes) and checked `transportation_name` geometry types across all its features: **36 are `MultiLineString`, 101 are `LineString`** — never `Point`. So roughly a quarter of the road-name features in this specific Planetiler/OpenMapTiles extract violate the single-ring assumption `mergeLines()` depends on. For any such feature that gets merged with a same-named neighbor, the merge only reads/writes `geometry[0]`, silently dropping the other ring(s) of that feature, and leaves the "donor" feature's `geometry[0]` cleared to `[]` while `feature.geometry` (the outer vector) is left with a leftover empty sub-array rather than being fully emptied — an edge case the later anchor-generation pass isn't guaranteed to handle cleanly for `symbol-placement: "line"`, unlike the point-placement layers, which never enter this code path at all (`mergeLines()` is gated strictly behind `SymbolPlacement == Line`).
+
+By contrast, `"symbol-placement": "line-center"` (`SymbolPlacementType::LineCenter`) uses a completely separate anchor branch that does **not** call `mergeLines()` and correctly iterates every line in the feature:
+
+```cpp
+} else if (layout->get<SymbolPlacement>() == SymbolPlacementType::LineCenter) {
+    for (const auto& line : feature.geometry) {
+        if (line.size() > 1) { ... }
+    }
+}
+```
+
+`line-center` still sets `TextRotationAlignment: Map` (same as `line` — confirmed in `createLayout()`, `symbol_layout.cpp`), so the label still orients along the road's direction; it just places one label at the line's center instead of repeating labels every `symbol-spacing` along its length.
+
+**Fix applied**: changed `road-label`'s `"symbol-placement"` from `"line"` to `"line-center"` in `style_template.json`. Left `symbol-spacing` in place (harmless — unused by `line-center`); nothing else about the layer changed (filter from §48, coalesce text-field, fonts, colors all untouched).
+
+### Scope discipline
+
+Investigated only the `road-label` rendering path; did not touch `water-label`, `poi-label`, `place-label`, `OfflineMapManager.kt`, the mbtiles asset, or any glyph files. No new assets needed — this is a pure style-JSON property change, so (like §48) it only requires a rebuild, not a reinstall of new binary assets.
+
+### Still not verified
+
+This is the strongest evidence-based lead found via direct source inspection (a real, confirmed architectural mismatch between our data — mixed LineString/MultiLineString `transportation_name` features — and the one code path that's uniquely exercised by `"line"` placement and not by any of the three working layers), but it has **not** been confirmed by an actual crash log, a reproduced empty-bucket trace, or a rebuild on the user's device. If `line-center` still shows no road labels after a rebuild, that would rule out this theory and point at something shared by all four label layers that simply happens to be masked for place-label by different data shape (e.g. a font/glyph-loading timing issue, or the labels rendering but being placed off the visible collision-priority order) — worth checking at that point whether water-label/poi-label labels are *also* absent (not yet confirmed either way), since that would immediately tell us whether this is a line-placement-specific bug or something wider that just happens to spare place-label.
+
+## 50. 2026-09-18 — free-pan map + recenter button, tablet nav-pointer diagnostic, and a real (small) fix for unnamed highways
+
+Three separate asks from the same message. Fixed #1 and part of #3 directly; #2 (tablet) got a diagnostic, not a blind fix, because I have no way to confirm sensor hardware on that specific device from here -- see "Still not verified" below for exactly what to check and why I stopped short of guessing.
+
+### 1. Free-pan map + recenter button -- fixed
+
+Root cause: `ui/components/MapView.kt`'s `AndroidView` `update` lambda called `map.moveCamera(CameraUpdateFactory.newLatLng(currentLatLng))` **unconditionally on every recomposition** -- which fires on every location/heading update from the nav pipeline, i.e. multiple times a second during active navigation. Any manual pan/zoom gesture was immediately overwritten by the next forced recenter before the user could see anything away from the vehicle. Gestures themselves were never disabled (MapLibre's defaults are all-enabled and nothing in the codebase touched `uiSettings`) -- the map just fought the user's input every frame.
+
+Fix: added an `isFollowingUser` state (default `true`, preserving today's locked-follow behavior). The forced `moveCamera` in the update lambda is now gated behind it. A `MapLibreMap.OnCameraMoveStartedListener` flips it to `false` the moment it sees `REASON_API_GESTURE` (a real user drag/pinch, as opposed to our own programmatic camera moves). The existing "📍 MY LOCATION" button and the "🎯" recenter button both now set `isFollowingUser = true` on tap (in addition to their existing camera-move call), so either one snaps back to locked-follow. The 🎯 button's fill color also now reflects state -- white while following, blue (matching MY LOCATION's color) once the user has panned away, as a "tap to recenter" affordance. Also explicitly set `uiSettings.isScrollGesturesEnabled/isZoomGesturesEnabled/isRotateGesturesEnabled/isTiltGesturesEnabled/isDoubleTapGesturesEnabled = true` so free gesture control is never silently dependent on MapLibre's defaults.
+
+Pure `MapView.kt` change, no new assets, no style/data changes -- needs only a rebuild.
+
+### 2. Tablet nav-pointer "stuck in one direction" -- diagnosed, not blindly fixed
+
+Traced the heading pipeline end to end (`sensors/SensorManager.kt` → `sensors/SensorFusionManager.kt` → `DeadReckoningEngine.kt`'s `currentHeadingDeg = orientation.headingDegrees` → `NavigationState.headingDeg` → `MapView`'s vehicle-marker rotation). Found a real gap: `SensorFusionManager.fusedAzimuth` starts at `0f` and is **only** ever updated by three paths -- `updateRotationVector()` (needs the `TYPE_ROTATION_VECTOR` virtual sensor), the gyro-integration line in `updateGyroscope()` (needs a physical gyroscope), or `updateSensorOrientation()` (needs *both* accelerometer *and* magnetometer -- it early-returns otherwise). If a device has none of those three combinations available -- concretely, an accelerometer-only tablet with no gyroscope and no magnetometer, which is a common spec on budget/education Android tablets -- `fusedAzimuth` never changes from its `0f` default for the entire session. That would look exactly like "stuck in one direction," and only on that device, while a normal phone (which virtually always has a gyroscope + magnetometer + fused rotation-vector sensor) works fine.
+
+I did **not** guess-fix this by rewiring the EKF's heading input (e.g. a GPS-course-over-ground fallback), because: (a) I can't confirm from here which sensors the actual tablet has, and (b) `currentHeadingDeg` isn't just cosmetic -- it feeds directly into `DeadReckoningEngine`'s physics/EKF pipeline, which has been carefully tuned and benchmarked (see the `FINAL_AUDIT_SUMMARY.md` work, §46). Rewiring that pipeline's heading source on a hardware guess risked corrupting position accuracy on every device, to maybe-fix a low-priority cosmetic issue on one.
+
+What I did instead: added a one-time diagnostic log to `SensorManager`'s `init` block (`Log.i("Gudumap:SensorManager", "Sensor hardware present on this device -- linearAccel=... rawAccel=... gyroscope=... magnetometer=... rotationVector=...")`). This is purely observational -- no behavior change, zero risk. Running the app on the tablet and checking Logcat for that tag will immediately confirm or rule out the hardware-gap theory.
+
+### 3. "Not every street has a name" -- one real fix applied, rest is genuine OSM data sparsity
+
+Decoded the same z14 verification tile used in §48/§49 and compared `transportation` (171 road-geometry features, used for drawing) against `transportation_name` (137 named features, used for labels) by class. Checked every `transportation_name` field available in this OpenMapTiles schema (`name`, `name:latin`, `name_en`, `ref`, `network`, `route_1_ref`, ...) against `road-label`'s actual text-field coalesce chain.
+
+Found a real, small gap: two `trunk`-class features in the sample tile (Mettupalayam Road / NH181 and a stretch of NH948) have `name`/`name:latin`/`name_en` all null but carry a real route number in `ref` (`"NH181"`, `"NH948"`) -- National Highway shields that OSM tags by number instead of (or in addition to) a local name. `road-label`'s text-field never looked at `ref`, so these rendered blank even though real, legitimate label content existed for them.
+
+Fix: added `["get","ref"]` as a fourth coalesce fallback: `["coalesce", ["get","name:en"], ["get","name:latin"], ["get","name"], ["get","ref"]]`. Re-checked the same tile after the change: of its 137 `transportation_name` features, 135 already had a name, 2 are now newly labeled via `ref` (the NH181/NH948 segments), and **0 remain blank** at the `transportation_name`-layer level in this tile.
+
+That last number is the important one: within the layer that actually feeds labels, coverage is now complete in the sample tile. The broader impression of "streets without names" almost certainly comes from road segments that never got an entry in `transportation_name` at all -- i.e. OSM simply has no `name` or `ref` tag for that segment (very common for unclassified/residential/service roads and minor tracks, everywhere in OSM, not specific to this extract). No style or pipeline change can label a road that has no name in the source data; this matches how every other map product (including Google Maps) behaves for the same class of road.
+
+### Scope discipline
+
+Touched only `MapView.kt` (free-pan), `SensorManager.kt` (one `Log.i` line, no behavior change), and `style_template.json`'s `road-label.layout.text-field` (one added coalesce branch). Did not touch `DeadReckoningEngine.kt`, the EKF, `OfflineMapManager.kt`, or any other label layer.
+
+### Still not verified
+
+None of this has been run on a device yet (no build access from this session, as established throughout this project). Specifically: (1) the free-pan/recenter behavior needs an actual gesture test -- pan away, confirm the camera stays put and the 🎯 button turns blue, tap it, confirm it snaps back and turns white again; (2) the tablet sensor-presence log needs to actually be read from Logcat on that tablet to confirm or rule out the hardware-gap theory before any further fix is attempted there; (3) the `ref` fallback fix needs a rebuild to confirm NH181/NH948 (and similarly-tagged roads elsewhere in the full extract, not just this one sample tile) now render.
+
+## 51. 2026-09-18 — DR distance stat frozen during ordinary (non-blackout) walking: trajectoryIntegrator was never fed from GNSS-fused position
+
+### What was actually done
+
+User reported: after the §50 fixes, the map/nav experience "works fine," but the on-screen distance-travelled stat (`navState.distanceMeters`, `NavigationScreen.kt` line 669) doesn't increase at all while walking around -- despite this being accurate in an earlier version of the app.
+
+Traced the full path backwards from the UI stat: `NavigationScreen`'s `navState.distanceMeters` → `NavigationState.distanceMeters` → `NavigationEngine.kt:652`'s `distanceMeters = drState.distanceTravelled` → `DeadReckoningEngine.distanceTravelled` → `trajectoryIntegrator.getTotalDistance()` (`tracking/TrajectoryIntegrator.kt`). `TrajectoryIntegrator` only accumulates distance inside `addPoint()`, and only when the added point's `isStationary` flag is false -- so the real question was: what calls `addPoint()`, and under what conditions.
+
+Grepped every `trajectoryIntegrator.addPoint(...)` call site in `DeadReckoningEngine.kt`. All of them live inside the periodic ML/DR window-processing step (the function around the ML kinematic-plausibility gate, ZUPT stationary check, and the blackout-only pedestrian fallback) -- the whole pipeline that PROJECT_STATUS.md's §24/§25/§32/§33 entries describe deliberately hardening against runaway drift *during GNSS blackout*, and which the code's own comments note was "validated for vehicle motion only." Critically, `isPedestrianFallbackActive` (the one branch meant to handle non-vehicle motion sanely) is gated behind `isBlackoutMode` -- it's structurally impossible for it to engage during normal, GPS-available walking.
+
+Then checked `correctWithGnss(latitude, longitude, ...)` -- the function that runs on every real GPS fix while blackout is *not* active (i.e. exactly the "just walk around with GPS on" scenario). It fuses the GNSS fix into the EKF and updates `currentLat`/`currentLon` correctly (so the map marker does move, matching the user's "the rest works fine") -- but it never once called `trajectoryIntegrator.addPoint(...)`. So outside of blackout mode, nothing was telling the distance integrator that any ground-truth GPS movement had happened at all; the only thing that ever could have fed it was the vehicle-tuned DR window path, which (being outside blackout, so no pedestrian fallback, and processing pedestrian-scale accelerations through gating designed around vehicle kinematics) very plausibly produces near-zero displacement most windows -- consistent with "doesn't move a bit."
+
+**Fix**: added a `trajectoryIntegrator.addPoint(...)` call at the end of `correctWithGnss(latitude, longitude, ...)` (`DeadReckoningEngine.kt`), right after `currentLat`/`currentLon` are updated from the Kalman-fused GNSS position, using `isStationary = zuptDetector.isNavStationary` (same flag every other call site already uses) so genuine GPS jitter while actually standing still still doesn't fake-accumulate distance. This function's own `isBlackoutMode` early-return (a few lines above the edit) means the new call can only ever execute in normal/non-blackout mode -- it is structurally incapable of running during, or altering, the blackout-mode DR-distance behavior that the rest of this project's benchmarking (`FINAL_AUDIT_SUMMARY.md`, §46) depends on.
+
+### Scope discipline
+
+One function touched (`correctWithGnss(Double, Double, ...)` in `DeadReckoningEngine.kt`). Did not touch ZUPT thresholds, the ML kinematic gate, NHC, the pedestrian fallback, or anything reachable during blackout mode -- all of that machinery is exactly as tuned/benchmarked before this entry, on purpose: it's the validated subject of this whole project, not something to retune on a guess.
+
+### Still not verified
+
+Not run on a device. The fix directly closes the one gap that logically explains the reported symptom (ground-truth GPS movement never reaching the distance counter in normal mode) without touching anything blackout-related, but there's a second, lower-confidence possibility worth ruling out if this alone doesn't fully resolve it: ZUPT's stationary thresholds (`accMagnitudeThreshold`/`horizontalAccThreshold` in `ZuptDetector.kt`) were written and tuned with full-vehicle-stop detection in mind, and a phone held very smoothly/steadily while walking (as opposed to swinging in hand, or foot-mounted) can sometimes dip under those thresholds during parts of a gait cycle and falsely register brief stationary windows -- this would only partially damp the new GPS-fed distance accumulation (GPS fixes still arrive and still update position regardless of ZUPT state) rather than fully freeze it, so it should be a much smaller effect than the bug just fixed, but worth watching for if the distance stat still feels sluggish rather than fully frozen after this rebuild.
+
+## 52. 2026-09-18 — confirmed live (screenshots): ZUPT was latching "STATIONARY" during actual blackout-mode walking, ~5-10x too fast; fixed the timing bug, not the thresholds
+
+### What was actually done
+
+User sent screenshots from an actual GNSS-blackout test session (the in-app "Navigating without GPS" / "GNSS BLACKOUT ACTIVE" UI, Conservative/pedestrian mode correctly shown active): "DR Distance" stuck at 0.0 m, the app's own "Motion" indicator reading STATIONARY, while the person was walking -- and a wildly off-road, straight-line red trail running far off the visible map.
+
+This is a different code path from §51 (which only fixed the non-blackout `correctWithGnss` case) -- this is the blackout-mode DR window-processing path, gated by `zuptDetector.isNavStationary`. §51 could not and did not touch this; confirmed via re-reading that function's `isBlackoutMode` early-return.
+
+**Root cause, found and now directly confirmed by the screenshots**: `ZuptDetector`'s "has this been stationary long enough to confirm it" check (`minConsecutiveSamples = 4`) was a raw sample COUNT, documented in its own old comment as "~400ms at 10Hz". But `ZuptDetector.update()` is driven by `DeadReckoningEngine.addSensorSample()`, which runs once per raw accelerometer OR gyroscope callback from `NavigationEngine.onSensorStep()` -- both sensors registered at `SENSOR_DELAY_GAME` (~50Hz each), so the combined call rate is far closer to ~100Hz than the assumed 10Hz. 4 samples at that real rate confirms "stationary" after roughly 40-80ms, not 400ms -- comfortably inside the brief low-acceleration moment within a single pedestrian stride (between a step's propulsion and braking phases), which is exactly what let a steadily-carried phone latch into STATIONARY and stay there while genuinely walking. This matches the screenshots exactly: Motion=STATIONARY, DR Distance=0.0m, for the whole visible session.
+
+**Fix**: rewrote `ZuptDetector.kt`'s confirmation mechanism from sample-counting to real elapsed time, measured from each `ImuSample.timestampNs` (nanosecond, monotonic). `minConsecutiveSamples: Int = 4` → `minStationaryDurationMs: Float = 400f`; the rotating-in-place equivalent (`consecutiveRotatingCount >= 2`) → `minRotatingDurationMs: Float = 200f` (same 2:1 ratio as before). This restores the *originally documented and presumably originally validated* ~400ms debounce -- it is not a new, guessed threshold, it is a fix to a unit/rate mismatch that silently shortened the intended debounce by roughly 5-10x. None of the actual physical detection conditions changed (`accMagnitudeThreshold`, `accVarianceThreshold`, `horizontalAccThreshold`, `gyroMagnitudeThreshold`, etc. are all untouched, byte-for-byte the same values) -- only how long a condition must hold before being acted on. This applies identically to vehicle mode too (it's a general timing-correctness fix, not a pedestrian-only carve-out), so vehicle-mode ZUPT should also become slightly more correct, not just pedestrian mode.
+
+Also added a diagnostic log (`Log.i("Gudumap:ZuptDetector", ...)`) that fires only on `motionState` transitions (not every sample -- won't flood Logcat), printing the exact accMag/accVar/horizAcc/horizVar/gyroMag/gyroVar/gnssSpeed values that caused each transition. If STATIONARY still gets falsely latched after this fix, this log is the ground truth needed to re-tune the actual magnitude/variance thresholds correctly (from real numbers, not another guess).
+
+### On the "very uneven" / far-off-road red trail
+
+This is the NAIVE trail (`MapView.kt`'s `LAYER_NAIVE_TRAIL`, red, `#DC2626`) -- a deliberately uncorrected, no-ZUPT/no-EKF/no-ML raw double-integration of accelerometer data, drawn specifically as a visual contrast to the corrected (blue) trail. Its own code comment: "no ZUPT/ML/EKF involved, so it is expected to drift badly on its own." Pure double-integration of even tiny accelerometer bias/noise accumulates quadratically over time (a textbook IMU dead-reckoning failure mode), so a long, straight, unrealistic-looking drift line is the CORRECT, by-design behavior for this layer, not a new bug -- it exists to make exactly the point the screenshot makes at a glance: uncorrected IMU integration is bad, which is the whole reason this project's EKF/ZUPT/ML pipeline exists. Did not change this layer; flagging it for the user's judgment rather than silently altering a layer that's very likely an intentional demo/judging visual for this SIH project, not a defect.
+
+### Scope discipline
+
+Rewrote only `ZuptDetector.kt` (its public API surface -- `isStationary`/`isRotatingInPlace`/`isNavStationary`/`motionState`/`update()`/`reset()`, plus the two renamed constructor params -- is unchanged in shape; confirmed via grep that `DeadReckoningEngine.kt` is the only caller and constructs it with all-default args, so nothing else needed updating). Did not touch the ML gate, NHC, EKF, or the naive-trail rendering.
+
+### Still not verified
+
+Not run on a device. This fix directly targets a concretely-evidenced timing bug (not a guess), but the diagnostic log is there specifically in case real on-device numbers show the underlying magnitude/variance thresholds also need adjustment for hand-held pedestrian carry (as opposed to the vehicle-dashboard mounting they were likely validated against) -- see the Claude Code prompt given to the user for exactly how to check this on the tablet and phone both, alongside the still-open tablet sensor-presence question from §50.
+
+## 53. 2026-09-20 — clarified "ML Gate never CLAMPED" (expected in pedestrian mode, not a bug), labeled the naive trail, and attacked the actual build blocker
+
+### "ML Gate is never clamped not even under motion"
+
+Re-read the gate branch order in `processWindowInference()` (`DeadReckoningEngine.kt`). It's a single if/else-if chain: `if (isNavStationary) {...} else if (isPedestrianFallbackActive) {...} else if (modelRunner.ready) { ...ACCEPTED/CLAMPED/REJECTED... }`. `CLAMPED` is only ever assigned inside that last, vehicle-only `modelRunner.ready` branch. `isPedestrianFallbackActive` (`isBlackoutMode && currentMotionMode == CONSERVATIVE_MODE`) was true in the user's test (confirmed by the UI's own "🚶 Conservative" badge), which means the `modelRunner.ready`/ML-gate branch **structurally never executes** -- the pedestrian path bypasses the ML model and its gate entirely by design (the model is vehicle-only, per §24/§25's own comments), applying a raw, capped displacement instead and hard-coding `gateAction = REJECTED` purely as a telemetry label. So "never CLAMPED" is expected, correct behavior for Conservative/pedestrian mode specifically -- it isn't a sign anything is broken, and isn't a new, separate bug from §52.
+
+The actual blocker in that same screenshot is still the one §52 already targeted: "Motion: STATIONARY" is shown, and `isNavStationary` is checked *before* `isPedestrianFallbackActive` in that same chain, so a false-positive stationary read zeroes displacement regardless of which mode is active underneath it. Given no successful build has happened anywhere since §52 was written (see below), this is almost certainly still the pre-§52 binary -- i.e. this test doesn't show a new failure, it re-confirms the same not-yet-verified one from a different angle.
+
+### Naive trail labeled (§ used to be unlabeled)
+
+User's objection -- a dramatically drifting red line on screen while "DR Distance: 0.0 m" and "Motion: STATIONARY" are also shown -- is a real usability/credibility problem even though both individual numbers are technically correct (the red trail is a deliberately uncorrected reference; see §52 for why it's expected to drift). Added a small always-visible legend to `MapView.kt`, shown only while `blackoutMode` is true (the only time either trail draws anything): a blue swatch labeled "Corrected (this app's estimate)" and a red swatch labeled "Uncorrected reference only". Pure UI addition -- doesn't change what either trail actually computes or draws, only makes it unambiguous which line is the app's real output.
+
+### Attacked the build blocker directly
+
+Tried, from this session's own sandboxed device shell, to reproduce and work around the "Unable to establish loopback connection" failure that's blocked verification across this session and (per this doc's own history) earlier ones too. Confirmed this sandbox's own attempt fails differently and earlier (blocked at the Gradle distribution *download* step by this environment's own network allowlist, before ever reaching daemon startup) -- a separate, unrelated limitation specific to this cloud sandbox, not informative about the user's real machine.
+
+Added `org.gradle.daemon=false` to `gradle.properties`, with a detailed comment explaining why: "Unable to establish loopback connection" is Gradle's persistent background daemon failing to open its own local 127.0.0.1 IPC socket back to the process that launched it -- not a network/internet problem and not related to this project's code. This is a well-documented failure mode, most commonly caused by a VPN client, antivirus/corporate firewall TLS inspection, or an IPv6/localhost resolution mismatch intercepting or blocking loopback connections specifically for Java processes. Disabling the daemon makes each Gradle invocation a single self-contained process with no persistent daemon and therefore no loopback channel to fail -- the standard fix for this exact error, at the cost of slightly slower builds (no warm daemon reuse). Left further fallback steps (checking VPN/antivirus, `-Djava.net.preferIPv4Stack=true`) in the comment in case this alone doesn't clear it.
+
+### Scope discipline
+
+`MapView.kt` (legend only, no trail-computation change) and `gradle.properties` (one setting + comment). Did not touch `ZuptDetector.kt`, the ML gate, NHC, or EKF any further this entry -- §52 stands as the only behavioral change to that pipeline until it's actually verified on a device.
+
+### Still not verified
+
+Everything from §50 through this entry is still unverified on a real device -- three separate build/device avenues (this session's cloud sandbox, this session's device shell, and the user's own local Claude Code session with adb) have now all hit dead ends, for three different reasons (network allowlist, no device connected, and the loopback error respectively). The `org.gradle.daemon=false` change is a real, well-targeted attempt at the third one specifically, but it's a diagnosis from documentation and pattern-matching on the exact error text, not something confirmed against this project's actual failure -- next real step is the user (or their local Claude Code session) trying a build again with this setting in place and reporting the exact new error if it still fails.
+
+## 54. 2026-09-20 — first real device data since §50: Gradle's loopback failure root-caused to the JVM itself (not the project); §52's ZUPT fix shows no false-STATIONARY in a real blackout capture; a genuine new bug found and fixed from that same capture -- "DR Distance" pinned at 0.0 m for the entire blackout
+
+### Build (Phase 1): still blocked, but now precisely diagnosed
+
+`./gradlew assembleDebug --stacktrace` with §53's `org.gradle.daemon=false` still fails with `Unable to establish loopback connection`. The full trace, seen for the first time, ends in `java.net.SocketException: Invalid argument: connect` raised from `sun.nio.ch.UnixDomainSockets.connect0` inside `PipeImpl` during `Selector.open()` -- before Gradle does any work. Ruled out with evidence, not assumed: **JDK 17.0.17 and JDK 21.0.12 fail identically**; `-Djava.net.preferIPv4Stack=true` (via `JAVA_TOOL_OPTIONS`) changes nothing; a 5-line `Selector.open().close()` program with no Gradle involved fails the same way from both the Bash and PowerShell tools. So this is not the project, not Gradle config, not IPv6 -- any Java NIO Selector fails in this session's process environment. Android Studio builds on the same machine work (§39/§40), so the block is specific to how this session's shells run Java. Not attempted: disabling the tool sandbox (not authorized). No APK was built this entry; the APK already on disk/installed (2026-09-19) postdates §50-§52's source edits and predates §53's `MapView.kt` legend edit, so it contains the ZUPT fix and the §50 sensor diagnostic but **not** the trail legend.
+
+**Logcat filter pitfall (affects the instructions in §52/§53):** `adb logcat -s Gudumap:ZuptDetector` silently matches nothing -- adb parses the colon as `tag:priority`, so it looks for tag "Gudumap" at priority "ZuptDetector". Use `adb logcat | grep "Gudumap:ZuptDetector"` instead (same for every `Gudumap:*` tag).
+
+### §50 (Phase 3): sensor line captured, but from the wrong device
+
+The only attached device was a Galaxy S22 (SM-S901E), not the affected tablet. Its line: `Sensor hardware present on this device -- linearAccel=true rawAccel=true gyroscope=true magnetometer=true rotationVector=true`. This is a control reading only; it says nothing about the tablet. **No heading-fallback code was written** -- that remains gated on the tablet's own line. (App needed location permission granted via `adb shell pm grant` before `SensorManager` was even constructed.)
+
+### §52 (Phase 2): ZUPT -- no false-STATIONARY found in this capture; thresholds left untouched
+
+Real capture, 54 s of Conservative-mode blackout (`BLACKOUT_START` 22:49:43 -> `BLACKOUT_RECOVERY` 22:50:33, 49.5 s; GNSS-measured displacement 16.8 m). 39 ZUPT transitions logged. Every transition *into* STATIONARY carried values far below the thresholds, not borderline: e.g. `accMag=0.0095 accVar=1.0e-5 horizAcc=0.0043 gyroMag=0.0008` (22:49:39), `0.0360/7.4e-5/0.0059/0.0008` (22:49:46), `0.1082/2.9e-3/0.0842/0.0247` (22:50:10), `0.1509/1.05e-3/0.1499/0.0050` (22:50:21) against thresholds 0.25/0.04/0.35/0.10. The two long STATIONARY dwells (22:50:10.6 for 6.5 s, 22:50:21.2 for 8.8 s) have per-second ML window features `|a_h|` 0.06-0.15 m/s^2, `|w|` 0.03-0.12 rad/s -- the signature of a phone held still, not a hand-held walk (which reads |a_h| 0.4-6.7 in the surrounding MOVING seconds of the same capture). MOVING transitions fired at accMag 0.25-0.64. Time split: MOVING 28.2 s, STATIONARY 24.3 s, ROTATING_IN_PLACE 1.8 s. **Nothing here supports raising any threshold**, so none was changed. Caveat stated plainly: there is no ground-truth record of when the phone was actually still versus walked (the phone was USB-tethered; walking was intermittent), so this is "no evidence of a false positive", not proof of none. A longer untethered continuous walk would settle it.
+
+### New bug found in the same capture: "DR Distance" stuck at 0.0 m (fixed, unverified on device)
+
+`DR_UPDATE distance=` was **0.00 in all 591 samples**, and the recovery summary read `drDistance=0.0m` for a 49.5 s blackout where the position genuinely moved (DR lat/lon displaced 11.4 m; GNSS says 16.8 m). Meanwhile the `ML_GATE ... dist=` field (the integrator's raw total) climbed 0.05 -> ~3.7 m over the same blackout, so movement *was* being integrated. The on-screen value is `blackoutMetrics.drDistance = max(0, drState.distanceTravelled - blackoutStartDist)` (`NavigationEngine.kt`), so `blackoutStartDist` had to be larger than the blackout's own total.
+
+Root cause, confirmed in code and against the log: `setBlackoutMode(true)` snapshotted `blackoutStartDist = deadReckoningEngine.distanceTravelled` *before* calling `deadReckoningEngine.initialize(...)`, and `initialize()` calls `trajectoryIntegrator.reset()` (zeroing the total). Since §51 the integrator is fed from GNSS-fused position outside blackout, so the pre-blackout total is non-zero -- the log shows `ML_GATE ... dist=6.91` at 22:49:42, 1.8 s before the blackout began. After the reset the running total restarted from 0 and peaked at ~3.7 m, never exceeding the stale 6.91 m baseline, so `max(0, 3.7 - 6.91) = 0` for the whole blackout. (Before §51 the pre-blackout total was ~0, which is why this never showed.) A second, 1.1 s blackout at 22:49:38 also reported `drDistance=0.0m`.
+
+**Fix:** move the `blackoutStartDist` snapshot to *after* `initialize()` in `NavigationEngine.setBlackoutMode` (so it reads 0.0 post-reset). Two-line move plus a comment; no other logic touched.
+
+Also observed, not changed: the ML gate was REJECTED 191 of 195 windows (ACCEPTED 3, CLAMPED 1) in this pedestrian capture -- consistent with §53's finding that Conservative mode rarely accepts, not a new issue. The log's `speed=` field is km/h (max 2.36), despite the name.
+
+### Scope discipline
+
+Touched: `NavigationEngine.kt` (one statement moved + comment) and this file. Did not touch `ZuptDetector.kt`, the ML gate, NHC, EKF, map style, or any UI. Scratch files (log capture, Java test, screenshot) stayed in the session scratchpad.
+
+### Still not verified
+
+The `blackoutStartDist` fix is **not compiled and not run on a device** -- Gradle cannot start in this session, so it needs a rebuild in Android Studio and a repeat blackout walk; expected result: "DR Distance" and `DR_UPDATE distance=` rise from 0.00 in step with `ML_GATE dist=`. The §53 trail legend is still unseen on a device (not in the installed APK). §50's tablet diagnosis still needs the tablet's own `Sensor hardware present` line. §52's ZUPT fix still needs a continuous, untethered walk with a known ground-truth for a definitive false-positive check.
+
+## 55. 2026-09-20 — "locator direction inverted" + "naive trail is random while stationary": one real gyro sign bug found and fixed, one clarified as by-design, diagnostic logging added for the remaining open question
+
+### User's report (with §54's fix already in place and verified: "DR Distance: 5.5 m", no longer stuck at 0.0m)
+
+"The DR distance moves, but the locator movement and direction is inverted... And the Red line is so random even though I haven't moved... My location is still correct but the line is random." Screenshots show "Heading Conf.: UNRELIABLE".
+
+### Red naive trail "random" while stationary: not a new bug, same as §53's finding
+
+`naiveIntegrator` is fed via `transformer.rotateLocalToWorld(vehAcc, currentHeadingDeg)` on every raw accelerometer sample, with zero ZUPT/EKF/gating -- this is unchanged since §52/§53 and is the documented, intentional behavior of that layer ("no ZUPT/ML/EKF involved, so it is expected to drift badly on its own"). Pure double-integration of accelerometer noise -- even while genuinely stationary -- accumulates via a quadratic-in-time random walk, and the *direction* of that walk is essentially noise-driven, so "random-looking, even though I haven't moved" is exactly what an uncorrected double integrator is supposed to look like, not a regression. Did not change `naiveIntegrator` or `rotateLocalToWorld`; the §53 legend already labels this trail "Uncorrected reference only" for this reason.
+
+### "Locator direction is inverted": found and fixed one real bug, but with an important caveat
+
+Traced every step of the heading pipeline actually driving the vehicle marker's rotation (`iconRotate(headingDeg)` in `MapView.kt`, `iconRotationAlignment("map")`, map camera has no bearing tracking so no double-rotation is possible there) and the naive trail's heading input (`currentHeadingDeg`, set from `SensorFusionManager.getOrientation()` via `updateOrientation()`). Ruled out, by reading the actual code (not assumption): `map/MapMatcher.kt` (position-only, never touches heading; already ruled out pre-summary), `navigation/MapMatcher.kt` (only remaps lat/lon via `OsmRoadNetworkMapMatcher.match()`, passes `headingDeg` straight through unchanged, never returns a modified heading), `CoordinateTransformer.rotateLocalToWorld()` (standard, correctly-signed 2D rotation for a clockwise-from-north heading convention -- verified algebraically: heading=90° East correctly maps local-forward to world-East), `transformPhoneToVehicle()` (identity matrix by default; `setMountAngles()` is never called in the pedestrian path), and `updateRotationVector()`'s use of `SensorManager.getOrientation()` on the hardware rotation-vector matrix (standard, correct Android usage).
+
+Found one genuine bug in `SensorFusionManager.updateGyroscope()`'s manual complementary-filter fallback (used only when `hasHardwareRotation` is still false): `fusedAzimuth += gyroscope[2] * dt`. Android's gyroscope Z axis is positive counter-clockwise as seen from above the device (standard right-hand rule about +Z), but azimuth/heading is defined as rotation about *-Z* and increases *clockwise* (facing North=0° -> facing East=90°, i.e. turning right). Adding the raw gyro-Z reading integrates the fused heading in the opposite rotational sense from a real turn -- turning right would make the fallback estimate turn left, and vice versa. Fixed: `fusedAzimuth -= gyroscope[2] * dt`. This is a straightforward, independently-verifiable sign error against Android's own documented sensor conventions, not a guessed/tuned value.
+
+**Important caveat, stated plainly**: this fallback path only runs when `hasHardwareRotation` is false, i.e. before the first `TYPE_ROTATION_VECTOR` sample arrives, or continuously on a device with no rotation-vector sensor at all. The tested Galaxy S22 has a rotation-vector sensor (confirmed in §50/§54's own sensor log: `rotationVector=true`) and `updateRotationVector()` is called unconditionally on every sample regardless of the sensor's reported accuracy (no accuracy-based gating exists anywhere in the callback wiring) -- so on that device this buggy branch should have been dead code for the whole session, and is **not confirmed to be the cause of the inverted-direction report on the S22 specifically**. It is still a real, worth-fixing bug in its own right (it's the exact fallback path that would matter for a device with no rotation-vector hardware at all -- possibly relevant to the still-unverified §50 tablet issue).
+
+### What's still an open question, and why I didn't guess further
+
+With the sign bug ruled unlikely to explain the S22 report, the leading remaining hypothesis is a real-world pedestrian dead-reckoning caveat rather than a code defect: `SensorManager.getOrientation()`'s azimuth is only a reliable proxy for "which way am I walking" when the phone is held in a fairly consistent, close-to-flat pose. A phone carried naturally in hand while walking (swinging, tilting, screen toward the user rather than flat) causes real, physically-correct azimuth swings that don't track the walking direction -- and this app currently uses that raw device azimuth directly for both the marker rotation and (via `rotateLocalToWorld`) the naive trail's integration direction, with no pedestrian-carry compensation (e.g. `remapCoordinateSystem` for hand-carry orientation, or a stride-based PDR heading). This would plausibly explain both symptoms together, but per this project's standing rule, I'm not touching the heading-fusion algorithm on this hypothesis alone -- it needs real data first.
+
+To get that data cheaply on the next test, added a rate-limited diagnostic log to `SensorFusionManager.getOrientation()` (`Log.i("Gudumap:SensorFusionManager", "heading=... pitch=... roll=... hasHardwareRotation=... headingConfidence=...")`), firing at most once per ~5° of heading change rather than every sample, so it won't flood Logcat. Filter with `adb logcat | grep "Gudumap:SensorFusionManager"` (not `-s`, per §54's own logcat pitfall). Walking a known route (e.g. straight down one street) while capturing this will show directly whether `heading` tracks real walking direction, whether `hasHardwareRotation` is true throughout (confirming the sign-bug path is truly inactive), and whether `pitch`/`roll` show the phone held far from flat.
+
+### Scope discipline
+
+Touched only `SensorFusionManager.kt`: the one-line sign fix (behavior-changing only inside the already-probably-dead fallback branch) and the new diagnostic log (log-only, no behavior change). Did not touch `MapView.kt`, `naiveIntegrator`, `rotateLocalToWorld`, the naive trail, or any EKF/ZUPT/ML-gate logic.
+
+### Still not verified
+
+Not compiled or run on a device from this session (no build access here, same as §50-§53). Needs: a rebuild, then a walking test capturing the new `Gudumap:SensorFusionManager` log to (a) confirm whether `hasHardwareRotation` really is true throughout on the S22 (if it ever reads false mid-session, the sign fix directly matters there too), and (b) compare logged `heading` against the actual walked direction to test the phone-carry-pose hypothesis. The naive trail's "randomness" is not expected to change and isn't a target of this fix -- flagging again for the user's judgment whether the §53 legend is sufficient or whether the naive trail should be hidden/toned down for demo purposes (a product decision, not a bug fix).
+
+## 56. 2026-09-28 — UI-only pass: details drawer opacity, screen-timeout fix, blackout-arm timeout, de-duplicated metric tile
+
+User instruction for this pass: raise the details drawer's opacity a little (keep it translucent), make any other fixes judged necessary, and **do not touch the model** (reported as working correctly after testing). Interpreted conservatively: no changes to the ML model/assets, `ModelRunner`, `DeadReckoningEngine`, `ZuptDetector`, `SensorFusionManager`, the EKF, or any threshold. Every change below is in `ui/` only.
+
+### What was actually done
+
+1. **Details drawer opacity** — `GlassCard` gained an optional `opacity` parameter (top of its sheen gradient; bottom is always 0.14 lower). Default `0.72f` reproduces the old gradient exactly, so the status pill, permission banner and every other caller are pixel-identical. `DetailsDrawer` now passes `0.84f` (gradient 0.84 → 0.70, was 0.72 → 0.58): still translucent frosted glass over the map, but the dense stat text stays readable over busy road/label tiles. One constant to tune if it's too much or too little.
+2. **Screen kept awake while `NavigationScreen` is shown** (`LocalView.keepScreenOn`, released in `onDispose`). Real bug, not polish: the existing lifecycle observer calls `pauseNavigation()` on `ON_PAUSE`/`ON_STOP`, so a screen timeout mid-walk or mid-drive silently stopped sensors + location and froze dead reckoning wherever the screen slept. Any blackout test longer than the phone's screen-timeout setting was affected.
+3. **Blackout arm stage auto-disarms after 5 s.** The two-tap arm-then-confirm flow previously stayed armed indefinitely after the first tap, leaving a red "START GNSS BLACKOUT" button one accidental tap away from starting a demo-critical mode. The `setBlackoutMode(...)` calls themselves are unchanged.
+4. **Removed a duplicate tile.** BLACKOUT METRICS had an "ML Latency" tile showing exactly the same `mlInferenceLatencyMs` as "ML Inference" under NAVIGATION METRICS. Replaced with **Duration** (`blackoutMetrics.blackoutDurationSeconds`, already computed live by `NavigationEngine`, shown as m:ss).
+5. **Section label is honest about staleness**: "BLACKOUT METRICS · LIVE" during a blackout, "LAST BLACKOUT" otherwise (outside a blackout those tiles hold the previous blackout's stored final numbers, not live values).
+6. **Collapsed drawer shows a one-line summary during blackout** (`DR 12.3 m · ±4.8 m`), so the drawer doesn't have to be expanded over the map/trails just to read the two numbers most looked at during a demo.
+
+### Scope discipline
+
+Files touched: `ui/components/GlassCard.kt`, `ui/screens/NavigationScreen.kt`, this file. No model, engine, sensor, map-style, or threshold change.
+
+### Still not verified
+
+Not compiled or run from this session (no build access here). Needs an Android Studio rebuild. Check: drawer looks a bit more solid but still see-through; screen stays on during a long blackout walk; tapping "GNSS AVAILABLE" once and waiting 5 s returns it to green; "Duration" ticks up during a blackout.
+
+## 57. 2026-09-28 — overlapping on-screen controls fixed (from a real device screenshot)
+
+User screenshot (Galaxy phone, map-first layout) showed overlaps at both ends of the screen. Causes, read from the code rather than guessed:
+
+- **Top:** `MapView`'s own floating badges ("COIMBATORE OFFLINE" + attribution at top-start, 🧭 heading at top-end) were positioned 12dp from the raw top of a full-screen map with no system-bar inset, so they drew under the status-bar icons and directly underneath `NavigationScreen`'s TopStatusPill (which *is* inset-aware). The attribution line was visibly running behind the pill. The badge also had a leftover 62dp start indent for a top-left control that no longer exists since §36.
+- **Bottom:** `MapView`'s "📍 MY LOCATION" pill (bottom-start) and 🎯/+/- stack (bottom-end) sat 12dp from the raw screen bottom — under the gesture bar and underneath the collapsed Details drawer. MapLibre's native logo and (i) attribution button were also stacked underneath both.
+
+### What was actually done (UI only — no model/engine/sensor/threshold change)
+
+1. `MapView` gained `overlayTopPadding`/`overlayBottomPadding` (default 0dp, so a non-full-screen embed is unchanged). All of MapView's floating controls now live in one plain `Box` that, when full-screen, applies `WindowInsets.safeDrawing` plus those paddings. No pointer input on that Box, so map pan/zoom gestures still reach the map.
+2. `NavigationScreen` passes `overlayTopPadding = 52.dp` (below the status pill) and `overlayBottomPadding = 64.dp` (above the collapsed drawer; puts the 🎯/+/- stack level with the GNSS blackout button at 76dp).
+3. Removed the "📍 MY LOCATION" pill — its click handler was identical to the 🎯 recenter button's (set follow mode + move camera to the current fix at zoom 16). The 🎯 button keeps its blue "you've panned away" highlight. This frees the bottom-left corner for the blackout button.
+4. Disabled MapLibre's native logo and (i) attribution widgets. The required "© OpenMapTiles © OpenStreetMap contributors" credit is still permanently visible in the COIMBATORE OFFLINE badge (legible, no interaction needed — what OSMF's guidelines ask for). MapLibre is BSD-licensed and doesn't require its logo.
+5. Start indent for the badge and the blackout trail legend: 62dp → 12dp.
+
+Resulting layout (top to bottom): status bar → status pill → row of [COIMBATORE OFFLINE badge … 🧭 heading] → (blackout only) trail legend under the badge → map → [GNSS button … 🎯/+/-] → Details drawer → gesture bar.
+
+### Still not verified
+
+Not compiled or run from this session. The 52dp/64dp values are computed from the pill's and drawer's own paddings/text sizes, not measured on a device — if any gap looks off after a rebuild, those two numbers in `NavigationScreen.kt` are the only knobs. The permission-request banner (only shown before location permission is granted) is a blocking prompt and still floats over the badge row by design.
+
+## 58. 2026-09-28 — map blank on launch until a blackout on/off cycle: switched MapLibre to TextureView
+
+### Report
+
+On app launch the map area stays blank; it only appears after turning GNSS blackout on and off once.
+
+### Diagnosis (from code + the symptom; not yet confirmed by logcat)
+
+Ruled out by reading the code: the style/tiles/camera. Nothing in the blackout path touches the style, the offline mbtiles, or the camera — `NavigationEngine.setBlackoutMode` never reaches `MapView`, and `MapView` only reacts by drawing trails/legend. The camera already follows the fix on every location update, and `moveCamera` requests a render each time, so the map is being rendered; it just isn't being *shown*. The one thing a blackout cycle reliably does to the view tree is force a re-layout (the status pill, FAB label and drawer header change size; the trail legend is added and removed).
+
+That points at MapLibre's default render surface. `MapLibreMapView(context)` uses a SurfaceView, which renders on a separate surface behind the app window and is only visible through a hole the view hierarchy punches for it. At launch it's created inside Compose underneath an opaque SplashScreen composable (1.3 s + 350 ms fade), and — likely compounded by a full-screen 0dp-radius `clip()` layer wrapped around it — the hole isn't re-established once the splash leaves, until a later layout pass repositions the AndroidView. That matches "blank until something unrelated re-lays out the screen".
+
+### Fix (MapView.kt only)
+
+1. `MapLibreMapView(context, MapLibreMapOptions.createFromAttributes(context).textureMode(true))` — render into a TextureView, which is drawn as ordinary content inside the view hierarchy (no hole-punching), so it shows as soon as a frame renders and also composes correctly under the translucent overlays. API confirmed against the MapLibre Android docs (`createFromAttributes(Context)`, `textureMode(Boolean)`, `MapView(Context, MapLibreMapOptions)`).
+2. Full-screen map no longer wrapped in `clip(RoundedCornerShape(0.dp))` + `border(0.dp)` (both no-ops visually, but an extra clipping layer over the map). The embedded card layout keeps its rounded corner and outline.
+
+No model, engine, sensor, style or threshold change.
+
+### Still not verified
+
+Not compiled or run from this session. Expected after rebuild: map visible immediately after the splash, no blackout cycle needed. If it is *still* blank, the SurfaceView theory is wrong and the next step is a logcat capture from launch (`adb logcat | grep -i "maplibre\|Gudumap:OfflineMap\|Gudumap:MapView"`), which would show whether the style loaded at all.
+
+## 59. 2026-09-28 — details drawer: more opaque + frosted sheen
+
+User asked again for more opacity and a frosted look on the Details drawer. `DetailsDrawer` now uses `GlassCard(opacity = 0.90f, frost = 0.07f)` (was 0.84, no frost; original default 0.72). `GlassCard` gained an optional `frost` parameter: a faint white vertical sheen over the navy tint (7% at the top fading to ~2.5%) and a brighter white hairline edge — the lighting cue that makes a tinted panel read as frosted glass. Default `frost = 0f`, so the status pill and every other GlassCard are unchanged. Real backdrop blur would still need the Haze library (deliberately not added — see GlassCard's own doc comment). UI-only; not compiled or run from this session.
+
+## 60. 2026-09-28 — one startup fix + five features (report card, auto GPS-loss blackout, record/export, replay, calibration hint)
+
+User asked to implement all recommended fixes/features. Constraint repeated: **don't touch the model.** Nothing in `ml/`, the ONNX asset, `DeadReckoningEngine`, `ZuptDetector`, `SensorFusionManager`, the EKF or any DR threshold was changed. Engine-side changes are limited to *when* `setBlackoutMode()` is called and *which GPS fixes count as ground truth for scoring*.
+
+### Fix: offline map set up once, off the main thread
+`OfflineMapManager` was constructed twice per launch (NavigationEngine + MapView), and each constructor copied/verified the mbtiles + glyph files synchronously on the main thread (and could overlap on a fresh install). Now: `OfflineMapManager.getInstance(context)` (process-wide), heavy work moved from `init` into `@Synchronized ensureInitialized()`. NavigationEngine kicks it off on `Dispatchers.IO` in `start()`; MapView resolves the style on IO via `rememberCoroutineScope` and calls `setStyle` back on the main thread.
+
+### Feature 1: post-blackout report card
+When a blackout ≥ 3 s ends, a card shows the engine's final `BlackoutMetrics` (already computed at recovery, nothing recomputed in UI): error vs real GPS when navigation resumed, drift %, duration, DR distance, max error, GPS straight-line start→end, stationary time, ML gate A/C/R, and whether it was manual / auto GPS-loss / auto internet-loss.
+
+**Related scoring fix:** during a blackout the engine was scoring DR against *every* location callback, including NETWORK_PROVIDER (cell/Wi-Fi) fixes that are often 100 m+ off — exactly what keeps arriving in a tunnel — so Max Error/drift partly measured the reference's error. Ground truth now only uses GPS-provider fixes with accuracy ≤ 50 m; the recovery reference prefers the last fresh (≤10 s) good/usable GPS fix over whatever callback came last. Also clears the previous blackout's `gnssGroundTruthLat/Lon` at blackout start.
+
+### Feature 2: automatic GPS-loss blackout (opt-in, off by default)
+Details → TOOLS → "Auto-detect GPS loss". When on: if no *good* fix (GPS provider, accuracy ≤ 25 m) arrives for 5 s **while moving**, blackout starts automatically, anchored at the last good fix (passed through a new `anchorOverride` param, since `latestRawGnssLocation` may be a coarse network fix by then). Ends automatically after 2 consecutive good fixes (no flapping at tunnel mouths). Guards: never before any good fix; not during GNSS_RECOVERY; silence while stationary refreshes the timer (GPS updates use a 1 m min-distance, so a stopped phone legitimately gets no fixes); refuses to anchor on a fix older than 15 s; a manual end suppresses re-triggering until a fresh good fix; grace period on enable and on resume. FAB shows "AUTO: GPS LOST (TAP TO END)". The older internet-loss auto trigger (§27) is untouched; it now shows as "AUTO: OFFLINE".
+
+### Feature 3: record + export (CSV + GPX)
+TOOLS → Record / Stop & save. `tracking/SessionRecorder.kt` snapshots the state the UI already receives at ≤ 2 Hz (position, naive + GPS reference during blackout, uncertainty, heading, speed, DR distance) into `filesDir/sessions/gudumap_session_<time>.csv`. Export writes a GPX next to it (tracks: app estimate / GPS reference during blackout / uncorrected naive) and opens the share sheet with both, via a new FileProvider (`${applicationId}.fileprovider`, `res/xml/file_paths.xml` exposes only `sessions/`). "● REC" shows in the status pill and drawer header while recording.
+
+### Feature 4: replay
+TOOLS → ▶ Replay plays the newest saved session on the map (real timing ÷ 1/2/4/8×, pauses capped at 1.5 s). MapView is just fed the recorded frames instead of live state, so trails/marker/uncertainty render exactly as they did live. The status pill becomes a replay pill; the blackout button + drawer are replaced by replay controls (time, speed, stop, progress). Live navigation keeps running underneath, untouched.
+
+### Feature 5: compass calibration hint
+If heading confidence stays LOW/UNRELIABLE for 5 s, a dismissible "move your phone in a figure-8" card appears (bottom-left, clear of the zoom stack). Once dismissed it stays hidden until confidence recovers and degrades again.
+
+### Verification actually done
+- Downloaded kotlinc 2.0.21 in the cloud sandbox and compiled all 35 app sources without Android/Compose/coroutines libraries on the classpath: **zero syntax errors**; every remaining error is an unresolved-dependency cascade (also present in untouched files).
+- Independent review subagent checked every call site vs. definition, imports, Compose scopes, threading, CSV/GPX round-trip and FileProvider authority: no compile blockers found. It found 5 logic issues (stationary false-trigger, stale anchor, stale GPS reference in recordings, mislabelled internet-loss blackouts, Stop not working during replay load) — all fixed above before this entry.
+
+### Still not verified
+Not built or run on a device. Needs an Android Studio build and: a short walk with auto-detect on (enter a building/basement), a recorded session exported to Google Earth/gpx.studio, a replay. Pre-existing and unrelated: `test/.../OfflineMapManagerTest.kt` asserts `MAX_ZOOM == 17` and uses `latNorth`/`lonEast` fields that don't exist (actual: 16 and `north`/`east`), so `testDebugUnitTest` won't compile until that test is updated — `assembleDebug` is unaffected.
+Side effect: `dead_reckoning/share/gudumap_src_review.zip` (a source snapshot used for the cloud compile check) was left in that folder — safe to delete.

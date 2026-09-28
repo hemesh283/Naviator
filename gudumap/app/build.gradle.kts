@@ -1,4 +1,4 @@
-plugins {
+  plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
@@ -38,7 +38,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("onnx", "map", "mbtiles", "sqlite", "json")
+        noCompress += listOf("onnx", "map", "mbtiles", "sqlite", "json", "pbf")
     }
 }
 
@@ -82,10 +82,15 @@ dependencies {
 
 
     // ============================================================
-    // OpenStreetMap / osmdroid
+    // MapLibre Native -- offline vector-tile map rendering (§42 migration, replacing
+    // osmdroid's raster rendering). Version confirmed directly against Maven Central's own
+    // maven-metadata.xml this session, not a search-result snippet (one source claimed a wrong
+    // "11.11.0" version number). minSdk requirement (API 23, since MapLibre v12.0.0) confirmed
+    // compatible with this project's minSdk=24. See PROJECT_STATUS.md for the full research
+    // trail behind this choice over PMTiles.
     // ============================================================
 
-    implementation(libs.osmdroid.android)
+    implementation("org.maplibre.gl:android-sdk:13.6.1")
 
 
     // ============================================================
@@ -94,6 +99,15 @@ dependencies {
     // ============================================================
 
     implementation("com.google.android.gms:play-services-location:21.3.0")
+
+
+    // ============================================================
+    // AndroidX SplashScreen (phase 4 rebrand) -- system-level cold-start
+    // background only (Theme.App.Starting in themes.xml); the actual Naviator
+    // mark/wordmark is drawn by Compose's own SplashScreen.kt, not this API.
+    // ============================================================
+
+    implementation("androidx.core:core-splashscreen:1.2.0")
 
 
     // ============================================================
