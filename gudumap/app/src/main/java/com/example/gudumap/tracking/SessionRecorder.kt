@@ -207,7 +207,7 @@ object SessionFiles {
 
         file.bufferedWriter(Charsets.UTF_8).use { w ->
             w.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-            w.write("<gpx version=\"1.1\" creator=\"Gudumap (SIH26168)\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
+            w.write("<gpx version=\"1.1\" creator=\"Naviator\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
             for ((name, segs) in tracks) {
                 if (segs.isEmpty()) continue
                 w.write("  <trk>\n    <name>$name</name>\n")

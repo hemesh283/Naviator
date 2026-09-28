@@ -1,8 +1,7 @@
 # Ground Truth & Leakage Audit Report: Real IO-VNBD Evaluation
 
-**Project:** SIH26168 — AI/ML based Intelligent Dead Reckoning System for Seamless Navigation  
-**Organization:** ISRO  
-**Repository:** `D:\dead_reckoning`  
+**Project:** Naviator — AI/ML-assisted dead reckoning for seamless navigation  
+**Repository:** `dead_reckoning/`  
 **Date:** September 2026  
 **Auditor:** Senior Edge AI & Inertial Navigation Engineer  
 

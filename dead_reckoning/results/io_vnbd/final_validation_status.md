@@ -1,9 +1,8 @@
 # Final Real IO-VNBD Validation Status
 
-**Project:** Smart India Hackathon 2026 (SIH26168)  
-**Problem Statement:** AI/ML based Intelligent Dead Reckoning System for Seamless Navigation  
-**Organization:** ISRO  
-**Repository:** `D:\dead_reckoning`  
+**Project:** Naviator — offline dead reckoning for GNSS-denied navigation  
+**Scope:** AI/ML-assisted dead reckoning for seamless navigation  
+**Repository:** `dead_reckoning/`  
 **Date:** September 2026  
 **Auditor:** Senior Edge AI & Inertial Navigation Engineer  
 

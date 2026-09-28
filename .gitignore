@@ -1,13 +1,11 @@
 # =============================================================================
-# SIH26168 monorepo .gitignore — covers gudumap/ (Android), SIH26168-DeadReckoning/
-# and dead_reckoning/ (both Python). Written after auditing actual file sizes on
-# disk (see docs/PROJECT_STATUS.md for the full audit) — nothing here is guessed.
+# Naviator monorepo .gitignore — covers gudumap/ (Android) and dead_reckoning/
+# (Python). Written after auditing actual file sizes on disk — nothing here is guessed.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Android / Gradle (gudumap/, and the stale nested copy under dead_reckoning/FE/)
-# Unanchored on purpose: matches at any depth, so it also covers the embedded
-# FE/gudumap/gudumap/ Android project copy without needing a separate entry.
+# Android / Gradle (gudumap/)
+# Unanchored on purpose: matches build output at any depth.
 # Confirmed regenerable build output, not source: gudumap/app/build/ alone is
 # ~272MB on this machine (dex, apk, merged native libs, compressed assets) and
 # includes a 47.5MB app-debug.apk; the FE/ copy's own build/ has a 78.8MB apk.
@@ -24,12 +22,9 @@ captures/
 local.properties
 
 # -----------------------------------------------------------------------------
-# Python (dead_reckoning/, SIH26168-DeadReckoning/)
-# .venv folders confirmed present at dead_reckoning/.venv and
-# SIH26168-DeadReckoning/backend/.venv — full installed environments (hundreds
-# of packages each), including at least one single file over 37MB
-# (_duckdb.cp313-win_amd64.pyd). Never belongs in git; each teammate creates
-# their own via `pip install -r requirements.txt`.
+# Python (dead_reckoning/)
+# Virtual environments are full installed package trees (hundreds of packages).
+# Never belongs in git; create your own via `pip install -r requirements.txt`.
 # -----------------------------------------------------------------------------
 .venv/
 venv/
@@ -62,22 +57,11 @@ __pycache__/
 dead_reckoning/data/raw/
 dead_reckoning/*.zip
 
-# Same category: a teammate's zipped local project state (couldn't `git push` while
-# traveling, so sent a zip instead -- PROJECT_STATUS.md §26). Extracted here purely as a
-# local reference for diffing across several sessions' merge work, never meant to be
-# committed. The zip itself is 337MB on its own -- 3.4x GitHub's 100MB hard block -- and
-# accidentally got swept into a commit via a broad `git add` once already (§31).
+# Same category: local copies/archives of the project kept for reference -- far
+# over GitHub's 100MB file limit and never meant to be committed.
 /teammate_version/
-/SIH-2026-main*.zip
+/*.zip
 
-# Same category, pre-emptively: this project's own data/README.md already
-# recommends never committing raw downloaded datasets or self-collected traces
-# here. Currently these two folders hold nothing but their own README — keep
-# the README trackable, ignore anything anyone drops in alongside it later.
-SIH26168-DeadReckoning/data/public_datasets/*
-!SIH26168-DeadReckoning/data/public_datasets/README.md
-SIH26168-DeadReckoning/data/raw_traces/*
-!SIH26168-DeadReckoning/data/raw_traces/README.md
 
 # -----------------------------------------------------------------------------
 # OS junk
@@ -95,4 +79,4 @@ dead_reckoning/share/
 /docs/*
 !/docs/images/
 dead_reckoning/docs/
-dead_reckoning/results/io_vnbd/SIH26168_Screening2_Brief.md
+dead_reckoning/results/io_vnbd/*Brief*.md
