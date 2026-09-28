@@ -15,6 +15,7 @@
   <img alt="ONNX Runtime" src="https://img.shields.io/badge/ONNX%20Runtime-on--device-005CED?logo=onnx&logoColor=white">
   <img alt="MapLibre" src="https://img.shields.io/badge/MapLibre-offline%20vector%20tiles-396CB2">
   <img alt="Smart India Hackathon 2026" src="https://img.shields.io/badge/Smart%20India%20Hackathon-2026%20%C2%B7%20SIH26168-FF9933">
+  <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green">
 </p>
 
 ---
@@ -31,6 +32,21 @@ GPS (and India's NavIC) needs line of sight to the sky. In tunnels, underground 
 - **Honest benchmark.** 288 simulated-outage evaluations (9 unseen drives × 10/30/60/120 s × 9 pipeline variants). A ground-truth heading leak in our own evaluation code was found, fixed, and every number regenerated — including retracting our previous headline result.
 - **Exact PyTorch → ONNX parity.** Maximum output difference of **1.2 × 10⁻⁶ m** between the trained model and the deployed ONNX file; the deployed artifact is SHA-256 hash-locked.
 - **Built for demos and field testing.** Automatic GPS-loss detection, live corrected-vs-uncorrected trails, a post-blackout error report scored against real GPS, session recording with CSV/GPX export, and replay.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/screenshots/live.png" alt="Live tracking on the offline map" width="240"></td>
+    <td align="center"><img src="docs/images/screenshots/blackout.png" alt="GPS blackout with live metrics and recording" width="240"></td>
+    <td align="center"><img src="docs/images/screenshots/report.png" alt="Post-blackout report scored against real GPS" width="240"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Live tracking</b><br><sub>offline vector map, heading marker</sub></td>
+    <td align="center"><b>GPS blackout</b><br><sub>dead reckoning, live metrics, recording</sub></td>
+    <td align="center"><b>Blackout report</b><br><sub>error measured against real GPS</sub></td>
+  </tr>
+</table>
 
 ## How it works
 
@@ -102,7 +118,6 @@ dead_reckoning/           Python ML + evaluation pipeline
   models/                 checkpoints and the frozen, hash-locked ONNX model
   results/io_vnbd/        benchmark outputs and audit reports
 docs/                     project status log, technical guide, branding
-SIH26168-DeadReckoning/   early prototype (superseded; kept for history)
 ```
 
 ## Getting started
@@ -145,6 +160,14 @@ No sensor data in this project is synthetic. The only simulated element in evalu
 - The navigation filter is a deliberately simple 6-state EKF (no sensor-bias states).
 - Offline map coverage is one demo region (Coimbatore).
 - Everything above is measured on recorded datasets; road testing on more devices is ongoing.
+
+## Authors
+
+Built by **Hemesh** ([@hemesh283](https://github.com/hemesh283)) — navigation engine, Android app, offline maps and evaluation — with teammates from the Smart India Hackathon 2026 team, who contributed parts of the ML pipeline and UI.
+
+## License
+
+Code is released under the [MIT License](LICENSE). Third-party data keeps its own terms: map data © OpenStreetMap contributors ([ODbL](https://opendatacommons.org/licenses/odbl/)), and the OxIOD / IO-VNBD datasets — including the processed training windows derived from them in `dead_reckoning/data/processed/` — are subject to their original licenses.
 
 ## Acknowledgements
 

@@ -144,6 +144,10 @@ fun MapView(
     // Defaults of 0.dp keep the embedded (non-full-screen) card layout exactly as before.
     overlayTopPadding: Dp = 0.dp,
     overlayBottomPadding: Dp = 0.dp,
+    // §61: lets the host hide the recenter/zoom stack while one of its own panels (expanded
+    // details drawer, blackout report card) covers that corner -- otherwise the buttons show
+    // through the translucent glass and overlap the panel's content.
+    showControls: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -539,7 +543,7 @@ fun MapView(
             // current position at zoom 16) and occupied the corner the GNSS blackout button and
             // details drawer need. The 🎯 button keeps its blue "tap to recenter" highlight
             // whenever the user has panned away.
-            Column(
+            if (showControls) Column(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(12.dp),

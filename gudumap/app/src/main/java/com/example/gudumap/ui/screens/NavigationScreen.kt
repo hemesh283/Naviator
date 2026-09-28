@@ -60,6 +60,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -318,6 +319,7 @@ fun NavigationScreen(
             // puts MapView's bottom-end 🎯/+/- stack level with BlackoutFab (76dp).
             overlayTopPadding = 52.dp,
             overlayBottomPadding = 64.dp,
+            showControls = !isDetailsExpanded && reportMetrics == null,
             modifier = Modifier.fillMaxSize()
         )
 
@@ -337,7 +339,6 @@ fun NavigationScreen(
         } else {
             TopStatusPill(
                 navState = navState,
-                isRecording = session.isRecording,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .windowInsetsPadding(WindowInsets.safeDrawing)
@@ -378,7 +379,9 @@ fun NavigationScreen(
                     .padding(horizontal = 12.dp, vertical = 12.dp)
             )
         } else {
-        BlackoutFab(
+        // §61: hidden while the details drawer is expanded -- it sat underneath the drawer's
+        // translucent glass and showed through it.
+        if (!isDetailsExpanded) BlackoutFab(
             navState = navState,
             blackoutControlStage = blackoutControlStage,
             onArm = { blackoutControlStage = 1 },
@@ -477,7 +480,7 @@ private enum class PillVisualState { LIVE, BLACKOUT, RECOVERING }
  *   implies anything true or false about how good the current fix/estimate is.
  */
 @Composable
-private fun TopStatusPill(navState: NavigationState, isRecording: Boolean = false, modifier: Modifier = Modifier) {
+private fun TopStatusPill(navState: NavigationState, modifier: Modifier = Modifier) {
     val visualState = when {
         navState.blackoutMode -> PillVisualState.BLACKOUT
         navState.gnssNavigationMode == "GNSS_RECOVERY" -> PillVisualState.RECOVERING
@@ -522,11 +525,15 @@ private fun TopStatusPill(navState: NavigationState, isRecording: Boolean = fals
                             .background(dotColor, shape = CircleShape)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
+                    // §61: one line only. In blackout the pill also carries the motion-mode badge,
+                    // and a wrapped two-line message pushed the pill down over the map badges.
                     Text(
                         text = message,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        color = TextPrimary
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -538,10 +545,7 @@ private fun TopStatusPill(navState: NavigationState, isRecording: Boolean = fals
                 Spacer(modifier = Modifier.width(6.dp))
                 MotionModeBadge(motionMode = navState.motionMode)
             }
-            if (isRecording) {
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(text = "● REC", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = StatusError)
-            }
+
         }
     }
 }
@@ -789,7 +793,7 @@ private fun DetailsDrawer(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         ToolButton(
-                            label = if (session.isRecording) "■ Stop & save" else "● Record",
+                            label = if (session.isRecording) "■ Save" else "● Record",
                             active = session.isRecording,
                             onClick = onToggleRecording,
                             modifier = Modifier.weight(1f)
@@ -1010,7 +1014,14 @@ private fun ToolButton(
             .padding(horizontal = 10.dp, vertical = 10.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = fg)
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = fg,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -1073,10 +1084,10 @@ private fun BlackoutReportCard(
             }
             Spacer(modifier = Modifier.height(8.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                MetricTile(title = "GPS start→end", value = String.format(Locale.US, "%.1f m", metrics.gnssReferenceDistance), modifier = Modifier.weight(1f))
+                MetricTile(title = "Start→end", value = String.format(Locale.US, "%.1f m", metrics.gnssReferenceDistance), modifier = Modifier.weight(1f))
                 MetricTile(title = "Stationary", value = formatDuration(metrics.stationaryDuration), modifier = Modifier.weight(1f))
                 MetricTile(
-                    title = "ML gate A/C/R",
+                    title = "ML A/C/R",
                     value = "${metrics.numberOfAcceptedMLPredictions}/${metrics.numberOfClampedMLPredictions}/${metrics.numberOfRejectedMLPredictions}",
                     modifier = Modifier.weight(1f)
                 )
@@ -1085,7 +1096,7 @@ private fun BlackoutReportCard(
             Spacer(modifier = Modifier.height(10.dp))
             Text(
                 text = "Error = distance between the app's dead-reckoned position and the real GPS fix when navigation resumed. " +
-                    "GPS start→end is straight-line, not path length.",
+                    "Start→end = straight-line GPS distance, not path length. ML A/C/R = gate accepted / clamped / rejected.",
                 fontSize = 10.sp,
                 color = TextMuted
             )

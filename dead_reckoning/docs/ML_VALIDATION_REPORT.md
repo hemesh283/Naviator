@@ -1,3 +1,5 @@
+> **Superseded (2026-09-28).** This report predates the fix for a ground-truth heading leak in the outage simulator and the move to a 9-baseline ladder; its benchmark numbers (including the 9.10% / 120 s headline) were retracted. Current, regenerated results: [`results/io_vnbd/FINAL_AUDIT_SUMMARY.md`](../results/io_vnbd/FINAL_AUDIT_SUMMARY.md).
+
 # ML & Dead Reckoning Navigation Validation Report: Real IO-VNBD Vehicle Domain Validation
 
 **Project:** Smart India Hackathon 2026 (SIH26168)  
