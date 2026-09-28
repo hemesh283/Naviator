@@ -89,3 +89,10 @@ desktop.ini
 # Local scratch/export folder (packages zipped up to send to teammates, compile-check
 # snapshots, etc.) -- derived copies of files already tracked elsewhere.
 dead_reckoning/share/
+
+# Team documentation -- kept locally for the team, not published. Only the images the
+# README uses are tracked under docs/.
+/docs/*
+!/docs/images/
+dead_reckoning/docs/
+dead_reckoning/results/io_vnbd/SIH26168_Screening2_Brief.md

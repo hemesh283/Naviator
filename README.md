@@ -116,7 +116,7 @@ dead_reckoning/           Python ML + evaluation pipeline
   src/evaluation/         outage simulator, 9-baseline benchmark, metrics
   models/                 checkpoints and the frozen, hash-locked ONNX model
   results/io_vnbd/        benchmark outputs and audit reports
-docs/                     project status log, technical guide, branding
+docs/images/              README images and charts
 ```
 
 ## Getting started
