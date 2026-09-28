@@ -487,10 +487,18 @@ class DeadReckoningEngine(
      * Feed incoming raw IMU sample into the pipeline.
      */
     fun addSensorSample(sample: ImuSample) {
-        if (!isEngineInitialized) {
-            isEngineInitialized = true
-            ekf.initialize(0.0, 0.0, 0.0)
-        }
+        // §62: this used to flip isEngineInitialized = true (with the EKF at 0,0) on the very
+        // first IMU sample. Sensors start seconds before the first GPS fix, so the engine was
+        // always "initialized" with originLat/originLon still at the 0.0/0.0 sentinel -- and
+        // correctWithGnss() then skipped its own initialize(lat, lon) branch and measured the
+        // first fix ~8,500 km from 0,0. The half-trusted Kalman update put the position in East
+        // Africa, far outside the offline map, so the map looked blank until a blackout cycle
+        // called initialize() with a real fix. Now the engine stays uninitialized until a real
+        // anchor arrives (first GPS fix via correctWithGnss, or initialize() at blackout start),
+        // exactly as the originLat/originLon comment above always described. Until then IMU
+        // samples still flow through ZUPT/buffers (initialize() resets them anyway), and the
+        // window/EKF steps are skipped by their own isEngineInitialized / ekf.isInitialized
+        // guards.
 
         // 1. Phone-to-vehicle coordinate transformation
         val phoneAcc = floatArrayOf(sample.ax, sample.ay, sample.az)
